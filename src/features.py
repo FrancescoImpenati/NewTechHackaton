@@ -33,6 +33,9 @@ PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 FIG_DIR = PROJECT_ROOT / "reports" / "figures"
 OUTPUT_PATH = PROCESSED_DIR / "features_stationary.parquet"
 SPREADS_PATH = PROCESSED_DIR / "spreads.parquet"
+FEATURES_CLEAN_PATH = PROCESSED_DIR / "features_stationary_clean.parquet"
+SPREADS_CLEAN_PATH = PROCESSED_DIR / "spreads_clean.parquet"
+ROUTING_PATH = PROCESSED_DIR / "routing_triggers.parquet"
 
 # Number of weekly observations used as the "4-week" horizon and the
 # realized-vol window (~20 trading days = 4 weeks).
@@ -304,6 +307,243 @@ def correlation_heatmap(
     ).reset_index(drop=True)
 
 
+# ---------------------------------------------------------------------------
+# Prompt 3.1 — collinearity cleanup + routing-engine triggers
+# ---------------------------------------------------------------------------
+# Columns dropped because they are collinear (|corr| > 0.9) with a kept twin.
+# For every dropped name both the level and its ``_chg4w`` variant are removed
+# (a no-op when one of the two does not exist in a given frame).
+COLLINEAR_DROP: list[str] = [
+    "hy_spread", "hy_spread_chg4w",            # keep hy_ig_spread
+    "us_term_10y_3m", "us_term_10y_3m_chg4w",  # keep us_term_10y_2y
+    "GTGBP20Y",                                 # keep GTGBP30Y
+    "GTDEM30Y",                                 # keep GTDEM10Y
+    "USGG30YR",                                 # keep GT10
+]
+
+
+def remove_collinear_features(df: pd.DataFrame, drop_list: list[str]) -> pd.DataFrame:
+    """Return ``df`` without the collinear columns present in ``drop_list``."""
+    present = [c for c in drop_list if c in df.columns]
+    return df.drop(columns=present).copy()
+
+
+# Routing-engine trigger layout. ``dxy_chg4w`` is intentionally shared between
+# the USD and Gold (Oro) domains (see build_routing_triggers docstring).
+ROUTING_DOMAINS: dict[str, list[str]] = {
+    "USD": [
+        "libor_3m_spread_chg4w",
+        "dxy_chg4w",
+        "vrp",
+        "us_10y_diff_chg4w",
+        "usa_world_relative",
+    ],
+    "Oro": [
+        "real_yield_proxy_chg4w",
+        "dxy_chg4w",
+        "jpy_strength",
+        "equity_bond_corr_13w",
+        "gold_oil_ratio_chg4w",
+    ],
+    "MBS": [
+        "vix_level",
+        "us_10y_vol_4w",
+        "us_term_10y_2y_level",
+        "libor_3m_spread_level",
+        "mxus_drawdown_52w",
+    ],
+}
+
+# level vs variation, used in the sanity-check summary.
+TRIGGER_TYPE: dict[str, str] = {
+    "libor_3m_spread_chg4w": "variation",
+    "dxy_chg4w": "variation",
+    "vrp": "level",
+    "us_10y_diff_chg4w": "variation",
+    "usa_world_relative": "variation",
+    "real_yield_proxy_chg4w": "variation",
+    "jpy_strength": "variation",
+    "equity_bond_corr_13w": "level",
+    "gold_oil_ratio_chg4w": "variation",
+    "vix_level": "level",
+    "us_10y_vol_4w": "level",
+    "us_term_10y_2y_level": "level",
+    "libor_3m_spread_level": "level",
+    "mxus_drawdown_52w": "level",
+}
+
+# Level triggers used as rule-based filters -> excluded from the ADF check.
+RULE_BASED_LEVELS: set[str] = {
+    "vix_level",
+    "us_term_10y_2y_level",
+    "libor_3m_spread_level",
+    "mxus_drawdown_52w",
+}
+
+
+def build_routing_triggers(
+    df_raw: pd.DataFrame,
+    df_stationary: pd.DataFrame,
+    df_spreads: pd.DataFrame,
+    horizon: int = HORIZON_4W,
+) -> pd.DataFrame:
+    """Build the 14 routing-engine triggers across the USD, Gold and MBS domains.
+
+    Returns one column per *unique* trigger (``dxy_chg4w`` is shared, so it
+    appears once). The domain layout (15 slots) lives in ``ROUTING_DOMAINS``.
+
+    Proxy / construction notes
+    --------------------------
+    * ``msci_world_proxy`` is an equal-weight developed-markets composite of
+      ``MXUS, MXEU, MXJP``. MSCI World (``MXWO``) is not in the dataset and
+      using ``MXUS`` alone — as elsewhere in this module — would make
+      ``usa_world_relative`` identically zero, so a composite is used here.
+    * ``Global Inflation-Linked Index`` -> ``LF94TRUU`` total-return index.
+    * ``dxy_chg4w`` is **deliberately shared** between the USD and Gold domains
+      with *opposite* economic reading: a stronger dollar (positive
+      ``dxy_chg4w``) is USD-supportive but gold-negative. It is kept in both
+      domains on purpose; cross-domain collinearity it induces is flagged, not
+      removed.
+    """
+    r = df_raw
+    out: dict[str, pd.Series] = {}
+
+    # ---- USD domain ------------------------------------------------------
+    out["libor_3m_spread_chg4w"] = (r["US0001M"] - r["USGG3M"]).diff(horizon)
+    out["dxy_chg4w"] = np.log(r["DXY"]).diff(horizon)
+    out["vrp"] = df_spreads["vrp"]
+    out["us_10y_diff_chg4w"] = r["GT10"].diff().diff(horizon)
+    world_cols = ["MXUS", "MXEU", "MXJP"]
+    r4w_world = np.log(r[world_cols]).diff(horizon).mean(axis=1)
+    out["usa_world_relative"] = np.log(r["MXUS"]).diff(horizon) - r4w_world
+
+    # ---- Gold (Oro) domain ----------------------------------------------
+    r4w_linker = np.log(r["LF94TRUU"]).diff(horizon)
+    out["real_yield_proxy_chg4w"] = (r["GT10"] - r4w_linker).diff(horizon)
+    out["jpy_strength"] = df_spreads["jpy_strength"]
+    out["equity_bond_corr_13w"] = (
+        df_stationary["MXUS"].rolling(13).corr(df_stationary["LUACTRUU"])
+    )
+    out["gold_oil_ratio_chg4w"] = df_spreads["gold_oil_ratio"].diff(horizon)
+
+    # ---- MBS domain ------------------------------------------------------
+    out["vix_level"] = r["VIX"]
+    out["us_10y_vol_4w"] = r["GT10"].diff().rolling(REALIZED_VOL_WEEKS).std()
+    out["us_term_10y_2y_level"] = r["GT10"] - r["USGG2YR"]
+    out["libor_3m_spread_level"] = r["US0001M"] - r["USGG3M"]
+    out["mxus_drawdown_52w"] = r["MXUS"] / r["MXUS"].rolling(52).max() - 1
+
+    return pd.DataFrame(out, index=df_raw.index)
+
+
+def routing_correlation(
+    triggers: pd.DataFrame,
+    path: Path = FIG_DIR / "routing_triggers_correlation.png",
+    pair_threshold: float = 0.7,
+    cross_threshold: float = 0.85,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """15-slot Pearson correlation across domains, with a block-grouped heatmap.
+
+    Builds the domain-ordered matrix (USD, Oro, MBS — 5 each, so ``dxy_chg4w``
+    appears twice), saves a heatmap with separators between the blocks, and
+    returns the pairs with ``|corr| > pair_threshold`` annotated intra/cross
+    domain. Cross-domain pairs above ``cross_threshold`` are flagged but never
+    dropped automatically.
+    """
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    # Domain-ordered slots (dxy_chg4w duplicated, labelled by domain).
+    slots = [(dom, name) for dom in ("USD", "Oro", "MBS") for name in ROUTING_DOMAINS[dom]]
+    labels = [f"{dom}:{name}" for dom, name in slots]
+    mat = pd.DataFrame({lab: triggers[name] for (dom, name), lab in zip(slots, labels)})
+    mat = mat.dropna(axis=0, how="any")
+    corr = mat.corr()
+
+    fig, ax = plt.subplots(figsize=(12, 10))
+    sns.heatmap(
+        corr, cmap="coolwarm", center=0, vmin=-1, vmax=1, square=True,
+        annot=True, fmt=".2f", annot_kws={"size": 7}, linewidths=0.3,
+        cbar_kws={"shrink": 0.7}, ax=ax,
+    )
+    for boundary in (5, 10):  # separators between USD | Oro | MBS blocks
+        ax.axhline(boundary, color="black", lw=2.5)
+        ax.axvline(boundary, color="black", lw=2.5)
+    ax.set_title("Routing triggers correlation (USD | Oro | MBS)")
+    fig.tight_layout()
+    FIG_DIR.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+
+    # Pairs above threshold, annotated intra/cross domain.
+    rows = []
+    for i in range(len(labels)):
+        for j in range(i + 1, len(labels)):
+            c = corr.iloc[i, j]
+            if abs(c) > pair_threshold:
+                dom_a, dom_b = slots[i][0], slots[j][0]
+                rows.append(
+                    {
+                        "feature_a": labels[i],
+                        "feature_b": labels[j],
+                        "corr": round(c, 3),
+                        "relation": "intra-dominio" if dom_a == dom_b else "cross-dominio",
+                    }
+                )
+    pairs = pd.DataFrame(rows)
+    if not pairs.empty:
+        pairs = pairs.reindex(pairs["corr"].abs().sort_values(ascending=False).index)
+        pairs = pairs.reset_index(drop=True)
+
+    if verbose:
+        print("\n" + "=" * 78)
+        print(f"ROUTING TRIGGERS — pairs with |corr| > {pair_threshold}")
+        print("=" * 78)
+        if pairs.empty:
+            print("None.")
+        else:
+            print(pairs.to_string(index=False))
+        cross_hi = pairs[(pairs["relation"] == "cross-dominio") & (pairs["corr"].abs() > cross_threshold)] if not pairs.empty else pairs
+        print(f"\nCross-domain collinearities > {cross_threshold} (flagged, NOT removed):")
+        if cross_hi.empty:
+            print("  None.")
+        else:
+            for _, row in cross_hi.iterrows():
+                print(f"  {row['feature_a']} ~ {row['feature_b']}  ({row['corr']})")
+            print("  -> deliberate (e.g. dxy_chg4w shared by USD & Oro with opposite reading).")
+        print(f"\nSaved heatmap -> {path}")
+    return pairs
+
+
+def routing_trigger_summary(triggers: pd.DataFrame, signif: float = 0.05) -> pd.DataFrame:
+    """ADF sanity check + per-domain summary of every routing trigger.
+
+    ``vix_level`` and the three MBS level filters are rule-based and excluded
+    from the statistical (ADF) test. Returns: trigger, domain, type (level vs
+    variation), stationary (yes/no/filter), n_obs.
+    """
+    rows = []
+    for dom in ("USD", "Oro", "MBS"):
+        for name in ROUTING_DOMAINS[dom]:
+            series = triggers[name].dropna()
+            if name in RULE_BASED_LEVELS:
+                stationary = "n/a (rule-based filter)"
+            else:
+                pvalue = adfuller(series, autolag="AIC")[1]
+                stationary = "yes" if pvalue < signif else "no"
+            rows.append(
+                {
+                    "trigger": name,
+                    "domain": dom,
+                    "type": TRIGGER_TYPE[name],
+                    "stationary": stationary,
+                    "n_obs": int(len(series)),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 def build(verbose: bool = True) -> pd.DataFrame:
     """Load, transform to stationarity, ADF-test, save parquet, return the df."""
     df = load_dataset(verbose=verbose)
@@ -363,5 +603,67 @@ def build(verbose: bool = True) -> pd.DataFrame:
     return stationary
 
 
+def build_routing(verbose: bool = True) -> pd.DataFrame:
+    """Prompt 3.1 pipeline: collinearity cleanup + routing triggers.
+
+    Step 1 drops collinear columns and writes ``*_clean.parquet``; Step 2 builds
+    the routing triggers and saves them; Step 3 produces the trigger
+    correlation matrix/heatmap; Step 4 runs the ADF sanity check.
+    """
+    if not (OUTPUT_PATH.exists() and SPREADS_PATH.exists()):
+        build(verbose=False)
+
+    df_raw = load_dataset(verbose=False)
+    df_stationary = pd.read_parquet(OUTPUT_PATH)
+    df_spreads = pd.read_parquet(SPREADS_PATH)
+
+    # --- Step 1: remove collinear features, save clean parquets -----------
+    stat_clean = remove_collinear_features(df_stationary, COLLINEAR_DROP)
+    spreads_clean = remove_collinear_features(df_spreads, COLLINEAR_DROP)
+    stat_clean.to_parquet(FEATURES_CLEAN_PATH)
+    spreads_clean.to_parquet(SPREADS_CLEAN_PATH)
+    if verbose:
+        print("=" * 78)
+        print("STEP 1 — collinearity cleanup (|corr| > 0.9)")
+        print("=" * 78)
+        dropped_stat = sorted(set(df_stationary.columns) - set(stat_clean.columns))
+        dropped_spr = sorted(set(df_spreads.columns) - set(spreads_clean.columns))
+        print(f"features_stationary: {df_stationary.shape[1]} -> {stat_clean.shape[1]} "
+              f"(dropped {dropped_stat})")
+        print(f"spreads            : {df_spreads.shape[1]} -> {spreads_clean.shape[1]} "
+              f"(dropped {dropped_spr})")
+        print(f"Saved -> {FEATURES_CLEAN_PATH}")
+        print(f"Saved -> {SPREADS_CLEAN_PATH}")
+
+    # --- Step 2: build routing triggers -----------------------------------
+    triggers = build_routing_triggers(df_raw, df_stationary, df_spreads)
+    triggers_clean = triggers.dropna(axis=0, how="any")
+    triggers_clean.to_parquet(ROUTING_PATH)
+    if verbose:
+        print("\n" + "=" * 78)
+        print("STEP 2 — routing triggers")
+        print("=" * 78)
+        print(f"{triggers.shape[1]} unique triggers | aligned obs: {len(triggers_clean)} "
+              f"({triggers_clean.index.min().date()} -> {triggers_clean.index.max().date()})")
+        print(f"Saved -> {ROUTING_PATH}")
+
+    # --- Step 3: correlation matrix + heatmap -----------------------------
+    routing_correlation(triggers, verbose=verbose)
+
+    # --- Step 4: ADF sanity check + summary -------------------------------
+    summary = routing_trigger_summary(triggers)
+    if verbose:
+        print("\n" + "=" * 78)
+        print("STEP 4 — ADF sanity check (rule-based level filters excluded)")
+        print("=" * 78)
+        print(summary.to_string(index=False))
+        tested = summary[summary["stationary"].isin(["yes", "no"])]
+        n_stat = int((tested["stationary"] == "yes").sum())
+        print(f"\nStationary at 5%: {n_stat}/{len(tested)} tested triggers")
+    return triggers_clean
+
+
 if __name__ == "__main__":
     build()
+    print("\n")
+    build_routing()
