@@ -1,0 +1,17 @@
+# Core data handling
+pandas
+numpy
+openpyxl          # required to read the Bloomberg .xlsx export
+
+# Machine learning
+scikit-learn
+tensorflow         # bundles Keras (tensorflow.keras)
+scipy
+statsmodels
+
+# Visualization
+matplotlib
+seaborn
+
+# Notebooks
+jupyter
