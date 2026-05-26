@@ -2,6 +2,7 @@
 pandas
 numpy
 openpyxl          # required to read the Bloomberg .xlsx export
+pyarrow           # parquet engine for data/processed outputs
 
 # Machine learning
 scikit-learn
