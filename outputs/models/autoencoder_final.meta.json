@@ -1,0 +1,10 @@
+{
+  "threshold_": 1.4464156274354698,
+  "input_dim_": 56,
+  "dropout": 0.15,
+  "lr": 0.001,
+  "max_epochs": 200,
+  "batch_size": 32,
+  "patience": 15,
+  "seed": 42
+}

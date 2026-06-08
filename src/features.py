@@ -1,0 +1,669 @@
+"""Stationarity transforms for the Bloomberg weekly dataset.
+
+Each raw series is mapped to one transformation *family* based on its economic
+nature (see ``TRANSFORM_MAP``):
+
+* ``log_return`` — weekly log-returns ``ln(x_t) - ln(x_{t-1})`` for **price-like
+  series**: equity indices, FX spot rates, gold, oil, commodity indices and
+  bond *total-return* indices. Prices are non-stationary in level (random-walk
+  with drift) but their log-returns are approximately stationary.
+* ``diff`` — first differences ``x_t - x_{t-1}`` for **yields, rates and
+  spreads**. These are already expressed in percentage points; differencing
+  removes the stochastic trend while keeping an interpretable "change in bps".
+* ``level`` — no transformation for series that are **already stationary**:
+  the VIX (mean-reverting volatility), the US Economic Surprise Index, and the
+  binary target ``Y``.
+
+Run as a script to transform the data, ADF-test every feature, print the
+results table and write ``data/processed/features_stationary.parquet``.
+
+    python -m src.features
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from statsmodels.tsa.stattools import adfuller
+
+from src.data_loader import PROJECT_ROOT, TARGET_COL, load_dataset
+
+PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
+FIG_DIR = PROJECT_ROOT / "reports" / "figures"
+OUTPUT_PATH = PROCESSED_DIR / "features_stationary.parquet"
+SPREADS_PATH = PROCESSED_DIR / "spreads.parquet"
+FEATURES_CLEAN_PATH = PROCESSED_DIR / "features_stationary_clean.parquet"
+SPREADS_CLEAN_PATH = PROCESSED_DIR / "spreads_clean.parquet"
+ROUTING_PATH = PROCESSED_DIR / "routing_triggers.parquet"
+
+# Number of weekly observations used as the "4-week" horizon and the
+# realized-vol window (~20 trading days = 4 weeks).
+HORIZON_4W = 4
+REALIZED_VOL_WEEKS = 4
+WEEKS_PER_YEAR = 52
+
+LOG_RETURN = "log_return"
+DIFF = "diff"
+LEVEL = "level"
+
+# Per-column transformation choice, grouped by family for documentation.
+TRANSFORM_MAP: dict[str, str] = {
+    # --- Prices -> weekly log-returns -------------------------------------
+    # Equity indices (MSCI)
+    "MXUS": LOG_RETURN,
+    "MXEU": LOG_RETURN,
+    "MXJP": LOG_RETURN,
+    "MXBR": LOG_RETURN,
+    "MXRU": LOG_RETURN,
+    "MXIN": LOG_RETURN,
+    "MXCN": LOG_RETURN,
+    # FX spot rates
+    "DXY": LOG_RETURN,
+    "GBP": LOG_RETURN,
+    "JPY": LOG_RETURN,
+    # Commodities / gold / oil
+    "XAUBGNL": LOG_RETURN,   # Gold spot
+    "Cl1": LOG_RETURN,       # 1st CL (crude oil) future
+    "CRY": LOG_RETURN,       # CRB commodity index
+    "BDIY": LOG_RETURN,      # Baltic Dry Index (trending freight-rate index)
+    # Bond total-return indices (price-like levels)
+    "EMUSTRUU": LOG_RETURN,
+    "LF94TRUU": LOG_RETURN,
+    "LF98TRUU": LOG_RETURN,
+    "LG30TRUU": LOG_RETURN,
+    "LMBITR": LOG_RETURN,
+    "LP01TREU": LOG_RETURN,
+    "LUACTRUU": LOG_RETURN,
+    "LUMSTRUU": LOG_RETURN,
+    # --- Yields / rates -> first differences ------------------------------
+    "GT10": DIFF,        # US 10Y
+    "USGG2YR": DIFF,
+    "USGG30YR": DIFF,
+    "USGG3M": DIFF,
+    "US0001M": DIFF,     # USD 1M LIBOR
+    "EONIA": DIFF,       # EUR overnight rate
+    "GTDEM2Y": DIFF,
+    "GTDEM10Y": DIFF,
+    "GTDEM30Y": DIFF,
+    "GTGBP2Y": DIFF,
+    "GTGBP20Y": DIFF,
+    "GTGBP30Y": DIFF,
+    "GTITL2YR": DIFF,
+    "GTITL10YR": DIFF,
+    "GTITL30YR": DIFF,
+    "GTJPY2YR": DIFF,
+    "GTJPY10YR": DIFF,
+    "GTJPY30YR": DIFF,
+    # --- Already stationary -> keep level ---------------------------------
+    "VIX": LEVEL,        # mean-reverting volatility index
+    "ECSURPUS": LEVEL,   # economic surprise index (oscillates around 0)
+    TARGET_COL: LEVEL,   # binary response variable (passthrough)
+}
+
+
+def _apply(series: pd.Series, transform: str) -> pd.Series:
+    if transform == LOG_RETURN:
+        if (series <= 0).any():
+            raise ValueError(
+                f"Cannot take log-returns of '{series.name}': non-positive values present."
+            )
+        return np.log(series).diff()
+    if transform == DIFF:
+        return series.diff()
+    if transform == LEVEL:
+        return series
+    raise ValueError(f"Unknown transform '{transform}' for column '{series.name}'.")
+
+
+def make_stationary(
+    df: pd.DataFrame,
+    transform_map: dict[str, str] = TRANSFORM_MAP,
+    dropna: bool = True,
+) -> pd.DataFrame:
+    """Apply the per-family transformation in ``transform_map`` to each column.
+
+    Columns missing from the map default to ``level`` (with a warning). The
+    leading row produced by differencing/log-returns is dropped when
+    ``dropna`` is True so the result is fully populated.
+    """
+    out = {}
+    for col in df.columns:
+        transform = transform_map.get(col)
+        if transform is None:
+            print(f"[features] '{col}' not in TRANSFORM_MAP -> defaulting to '{LEVEL}'.")
+            transform = LEVEL
+        out[col] = _apply(df[col], transform)
+
+    result = pd.DataFrame(out, index=df.index)
+    if dropna:
+        result = result.dropna(axis=0, how="any")
+    return result
+
+
+def adf_table(
+    df: pd.DataFrame,
+    signif: float = 0.05,
+    transform_map: dict[str, str] | None = None,
+) -> pd.DataFrame:
+    """Run the Augmented Dickey-Fuller test on every column.
+
+    Returns one row per feature with the ADF statistic, p-value, lags used,
+    number of observations, the 1%/5%/10% critical values, the applied
+    transform label, and a boolean ``stationary`` flag (p-value < ``signif``).
+    ``transform_map`` labels the transform shown per column (defaults to
+    ``TRANSFORM_MAP``); unknown columns are labelled ``level``.
+    """
+    labels = TRANSFORM_MAP if transform_map is None else transform_map
+    rows = []
+    for col in df.columns:
+        series = df[col].dropna()
+        stat, pvalue, usedlag, nobs, crit, _ = adfuller(series, autolag="AIC")
+        rows.append(
+            {
+                "feature": col,
+                "transform": labels.get(col, LEVEL),
+                "adf_stat": round(stat, 4),
+                "p_value": round(pvalue, 5),
+                "used_lag": usedlag,
+                "n_obs": nobs,
+                "crit_1%": round(crit["1%"], 3),
+                "crit_5%": round(crit["5%"], 3),
+                "crit_10%": round(crit["10%"], 3),
+                "stationary": bool(pvalue < signif),
+            }
+        )
+    return pd.DataFrame(rows).set_index("feature")
+
+
+# ---------------------------------------------------------------------------
+# Engineered spreads / relative-value features
+# ---------------------------------------------------------------------------
+# Documentation of every constructed feature and the kind of series it is.
+# Yield/sovereign spreads are true differences in percentage points. Credit/EM
+# "spreads" are RETURN-BASED PROXIES: the dataset ships credit *total-return
+# indices* (not yields) and has no Treasury or Global-Aggregate total-return
+# index, so we proxy them with log price-index ratios (safe leg minus risky
+# leg) — a rising value means the risky leg is underperforming, i.e. spreads
+# widening / risk-off. ``MSCI World`` is proxied by ``MXUS`` and ``Global
+# Aggregate`` by ``LUACTRUU`` (US IG Corporate), neither being in the dataset.
+SPREAD_KINDS: dict[str, str] = {
+    "us_term_10y_3m": "yield_spread",
+    "us_term_10y_2y": "yield_spread",
+    "de_term_10y_2y": "yield_spread",
+    "it_de_10y": "sovereign_spread",
+    "us_de_10y": "sovereign_spread",
+    "hy_spread": "credit_proxy(logratio)",
+    "hy_ig_spread": "credit_proxy(logratio)",
+    "em_spread": "credit_proxy(logratio)",
+}
+# Standalone derived features (single series each, not level+change spreads).
+STANDALONE_KINDS: dict[str, str] = {
+    "equity_bond_rot": "ret4w_diff",
+    "gold_oil_ratio": "ratio_level",
+    "vrp": "level",
+    "jpy_strength": "neg_ret4w",
+}
+
+
+def _logret_4w(series: pd.Series) -> pd.Series:
+    return np.log(series).diff(HORIZON_4W)
+
+
+def build_spreads(df: pd.DataFrame, horizon: int = HORIZON_4W) -> pd.DataFrame:
+    """Construct cross-asset spreads and relative-value features.
+
+    Expects the cleaned raw-level dataset (e.g. from ``load_dataset``). For
+    every spread in ``SPREAD_KINDS`` both the **level** and its **4-week
+    change** (``_chg4w``) are returned. Standalone features in
+    ``STANDALONE_KINDS`` are returned as a single series each. See the module
+    note above for the proxy choices on missing series.
+    """
+    out: dict[str, pd.Series] = {}
+
+    # --- Term-structure spreads (yield points) ----------------------------
+    out["us_term_10y_3m"] = df["GT10"] - df["USGG3M"]
+    out["us_term_10y_2y"] = df["GT10"] - df["USGG2YR"]
+    out["de_term_10y_2y"] = df["GTDEM10Y"] - df["GTDEM2Y"]
+
+    # --- Sovereign spreads (yield points) ---------------------------------
+    out["it_de_10y"] = df["GTITL10YR"] - df["GTDEM10Y"]   # BTP - Bund
+    out["us_de_10y"] = df["GT10"] - df["GTDEM10Y"]
+
+    # --- Credit / EM proxies (log price-index ratios, safe - risky) -------
+    log_hy = np.log(df["LF98TRUU"])     # US High Yield
+    log_ig = np.log(df["LUACTRUU"])     # US IG Corporate
+    log_mbs = np.log(df["LUMSTRUU"])    # US MBS (high grade / quasi-govt)
+    log_em = np.log(df["EMUSTRUU"])     # EM USD Aggregate
+    out["hy_spread"] = log_mbs - log_hy     # HY credit-risk premium proxy
+    out["hy_ig_spread"] = log_ig - log_hy   # quality spread (IG vs HY)
+    out["em_spread"] = log_ig - log_em      # EM vs IG
+
+    # Add the 4-week change for every spread above.
+    for name in list(out):
+        out[f"{name}_chg4w"] = out[name].diff(horizon)
+
+    # --- Standalone relative-value features -------------------------------
+    # Equity-bond rotation: 4w return of MSCI World proxy minus Global Agg proxy
+    out["equity_bond_rot"] = _logret_4w(df["MXUS"]) - _logret_4w(df["LUACTRUU"])
+    # Gold/oil ratio (rises when oil collapses -> classic risk-off)
+    out["gold_oil_ratio"] = df["XAUBGNL"] / df["Cl1"]
+    # Variance risk premium: implied (VIX) minus annualized realized vol of MXUS
+    realized_vol = (
+        np.log(df["MXUS"]).diff().rolling(REALIZED_VOL_WEEKS).std()
+        * np.sqrt(WEEKS_PER_YEAR) * 100
+    )
+    out["vrp"] = df["VIX"] - realized_vol
+    # JPY strength: negative 4-week return of USDJPY (yen up = risk-off haven)
+    out["jpy_strength"] = -_logret_4w(df["JPY"])
+
+    return pd.DataFrame(out, index=df.index)
+
+
+def correlation_heatmap(
+    originals: pd.DataFrame,
+    spreads: pd.DataFrame,
+    path: Path = FIG_DIR / "feature_spread_correlation.png",
+    redundancy_threshold: float = 0.9,
+) -> pd.DataFrame:
+    """Save a correlation heatmap of originals + spreads; return redundant pairs.
+
+    Aligns both frames on the common index, drops the target, and computes the
+    Pearson correlation. Returns the pairs with ``|corr| >=
+    redundancy_threshold``. Note: spread *levels* (yield/sovereign spreads,
+    gold/oil ratio, credit log-ratios) are persistent, so their correlations
+    with stationary returns should be read qualitatively.
+    """
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    orig = originals.drop(columns=[TARGET_COL], errors="ignore")
+    combined = orig.join(spreads, how="inner").dropna(axis=0, how="any")
+    corr = combined.corr()
+
+    n = corr.shape[1]
+    fig, ax = plt.subplots(figsize=(0.32 * n + 4, 0.32 * n + 3))
+    sns.heatmap(
+        corr, cmap="coolwarm", center=0, vmin=-1, vmax=1, square=True,
+        linewidths=0.3, cbar_kws={"shrink": 0.6}, ax=ax,
+    )
+    ax.set_title("Correlation: original features + engineered spreads")
+    fig.tight_layout()
+    FIG_DIR.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+
+    # Extract highly correlated (redundant) pairs from the upper triangle.
+    upper = corr.where(np.triu(np.ones(corr.shape, dtype=bool), k=1))
+    pairs = (
+        upper.stack()
+        .rename("corr")
+        .reset_index()
+        .rename(columns={"level_0": "feature_a", "level_1": "feature_b"})
+    )
+    redundant = pairs[pairs["corr"].abs() >= redundancy_threshold]
+    return redundant.reindex(
+        redundant["corr"].abs().sort_values(ascending=False).index
+    ).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Prompt 3.1 — collinearity cleanup + routing-engine triggers
+# ---------------------------------------------------------------------------
+# Columns dropped because they are collinear (|corr| > 0.9) with a kept twin.
+# For every dropped name both the level and its ``_chg4w`` variant are removed
+# (a no-op when one of the two does not exist in a given frame).
+COLLINEAR_DROP: list[str] = [
+    "hy_spread", "hy_spread_chg4w",            # keep hy_ig_spread
+    "us_term_10y_3m", "us_term_10y_3m_chg4w",  # keep us_term_10y_2y
+    "GTGBP20Y",                                 # keep GTGBP30Y
+    "GTDEM30Y",                                 # keep GTDEM10Y
+    "USGG30YR",                                 # keep GT10
+]
+
+
+def remove_collinear_features(df: pd.DataFrame, drop_list: list[str]) -> pd.DataFrame:
+    """Return ``df`` without the collinear columns present in ``drop_list``."""
+    present = [c for c in drop_list if c in df.columns]
+    return df.drop(columns=present).copy()
+
+
+# Routing-engine trigger layout. ``dxy_chg4w`` is intentionally shared between
+# the USD and Gold (Oro) domains (see build_routing_triggers docstring).
+ROUTING_DOMAINS: dict[str, list[str]] = {
+    "USD": [
+        "libor_3m_spread_chg4w",
+        "dxy_chg4w",
+        "vrp",
+        "us_10y_diff_chg4w",
+        "usa_world_relative",
+    ],
+    "Oro": [
+        "real_yield_proxy_chg4w",
+        "dxy_chg4w",
+        "jpy_strength",
+        "equity_bond_corr_13w",
+        "gold_oil_ratio_chg4w",
+    ],
+    "MBS": [
+        "vix_level",
+        "us_10y_vol_4w",
+        "us_term_10y_2y_level",
+        "libor_3m_spread_level",
+        "mxus_drawdown_52w",
+    ],
+}
+
+# level vs variation, used in the sanity-check summary.
+TRIGGER_TYPE: dict[str, str] = {
+    "libor_3m_spread_chg4w": "variation",
+    "dxy_chg4w": "variation",
+    "vrp": "level",
+    "us_10y_diff_chg4w": "variation",
+    "usa_world_relative": "variation",
+    "real_yield_proxy_chg4w": "variation",
+    "jpy_strength": "variation",
+    "equity_bond_corr_13w": "level",
+    "gold_oil_ratio_chg4w": "variation",
+    "vix_level": "level",
+    "us_10y_vol_4w": "level",
+    "us_term_10y_2y_level": "level",
+    "libor_3m_spread_level": "level",
+    "mxus_drawdown_52w": "level",
+}
+
+# Level triggers used as rule-based filters -> excluded from the ADF check.
+RULE_BASED_LEVELS: set[str] = {
+    "vix_level",
+    "us_term_10y_2y_level",
+    "libor_3m_spread_level",
+    "mxus_drawdown_52w",
+}
+
+
+def build_routing_triggers(
+    df_raw: pd.DataFrame,
+    df_stationary: pd.DataFrame,
+    df_spreads: pd.DataFrame,
+    horizon: int = HORIZON_4W,
+) -> pd.DataFrame:
+    """Build the 14 routing-engine triggers across the USD, Gold and MBS domains.
+
+    Returns one column per *unique* trigger (``dxy_chg4w`` is shared, so it
+    appears once). The domain layout (15 slots) lives in ``ROUTING_DOMAINS``.
+
+    Proxy / construction notes
+    --------------------------
+    * ``msci_world_proxy`` is an equal-weight developed-markets composite of
+      ``MXUS, MXEU, MXJP``. MSCI World (``MXWO``) is not in the dataset and
+      using ``MXUS`` alone — as elsewhere in this module — would make
+      ``usa_world_relative`` identically zero, so a composite is used here.
+    * ``Global Inflation-Linked Index`` -> ``LF94TRUU`` total-return index.
+    * ``dxy_chg4w`` is **deliberately shared** between the USD and Gold domains
+      with *opposite* economic reading: a stronger dollar (positive
+      ``dxy_chg4w``) is USD-supportive but gold-negative. It is kept in both
+      domains on purpose; cross-domain collinearity it induces is flagged, not
+      removed.
+    """
+    r = df_raw
+    out: dict[str, pd.Series] = {}
+
+    # ---- USD domain ------------------------------------------------------
+    out["libor_3m_spread_chg4w"] = (r["US0001M"] - r["USGG3M"]).diff(horizon)
+    out["dxy_chg4w"] = np.log(r["DXY"]).diff(horizon)
+    out["vrp"] = df_spreads["vrp"]
+    out["us_10y_diff_chg4w"] = r["GT10"].diff().diff(horizon)
+    world_cols = ["MXUS", "MXEU", "MXJP"]
+    r4w_world = np.log(r[world_cols]).diff(horizon).mean(axis=1)
+    out["usa_world_relative"] = np.log(r["MXUS"]).diff(horizon) - r4w_world
+
+    # ---- Gold (Oro) domain ----------------------------------------------
+    r4w_linker = np.log(r["LF94TRUU"]).diff(horizon)
+    out["real_yield_proxy_chg4w"] = (r["GT10"] - r4w_linker).diff(horizon)
+    out["jpy_strength"] = df_spreads["jpy_strength"]
+    out["equity_bond_corr_13w"] = (
+        df_stationary["MXUS"].rolling(13).corr(df_stationary["LUACTRUU"])
+    )
+    out["gold_oil_ratio_chg4w"] = df_spreads["gold_oil_ratio"].diff(horizon)
+
+    # ---- MBS domain ------------------------------------------------------
+    out["vix_level"] = r["VIX"]
+    out["us_10y_vol_4w"] = r["GT10"].diff().rolling(REALIZED_VOL_WEEKS).std()
+    out["us_term_10y_2y_level"] = r["GT10"] - r["USGG2YR"]
+    out["libor_3m_spread_level"] = r["US0001M"] - r["USGG3M"]
+    out["mxus_drawdown_52w"] = r["MXUS"] / r["MXUS"].rolling(52).max() - 1
+
+    return pd.DataFrame(out, index=df_raw.index)
+
+
+def routing_correlation(
+    triggers: pd.DataFrame,
+    path: Path = FIG_DIR / "routing_triggers_correlation.png",
+    pair_threshold: float = 0.7,
+    cross_threshold: float = 0.85,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """15-slot Pearson correlation across domains, with a block-grouped heatmap.
+
+    Builds the domain-ordered matrix (USD, Oro, MBS — 5 each, so ``dxy_chg4w``
+    appears twice), saves a heatmap with separators between the blocks, and
+    returns the pairs with ``|corr| > pair_threshold`` annotated intra/cross
+    domain. Cross-domain pairs above ``cross_threshold`` are flagged but never
+    dropped automatically.
+    """
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    # Domain-ordered slots (dxy_chg4w duplicated, labelled by domain).
+    slots = [(dom, name) for dom in ("USD", "Oro", "MBS") for name in ROUTING_DOMAINS[dom]]
+    labels = [f"{dom}:{name}" for dom, name in slots]
+    mat = pd.DataFrame({lab: triggers[name] for (dom, name), lab in zip(slots, labels)})
+    mat = mat.dropna(axis=0, how="any")
+    corr = mat.corr()
+
+    fig, ax = plt.subplots(figsize=(12, 10))
+    sns.heatmap(
+        corr, cmap="coolwarm", center=0, vmin=-1, vmax=1, square=True,
+        annot=True, fmt=".2f", annot_kws={"size": 7}, linewidths=0.3,
+        cbar_kws={"shrink": 0.7}, ax=ax,
+    )
+    for boundary in (5, 10):  # separators between USD | Oro | MBS blocks
+        ax.axhline(boundary, color="black", lw=2.5)
+        ax.axvline(boundary, color="black", lw=2.5)
+    ax.set_title("Routing triggers correlation (USD | Oro | MBS)")
+    fig.tight_layout()
+    FIG_DIR.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+
+    # Pairs above threshold, annotated intra/cross domain.
+    rows = []
+    for i in range(len(labels)):
+        for j in range(i + 1, len(labels)):
+            c = corr.iloc[i, j]
+            if abs(c) > pair_threshold:
+                dom_a, dom_b = slots[i][0], slots[j][0]
+                rows.append(
+                    {
+                        "feature_a": labels[i],
+                        "feature_b": labels[j],
+                        "corr": round(c, 3),
+                        "relation": "intra-dominio" if dom_a == dom_b else "cross-dominio",
+                    }
+                )
+    pairs = pd.DataFrame(rows)
+    if not pairs.empty:
+        pairs = pairs.reindex(pairs["corr"].abs().sort_values(ascending=False).index)
+        pairs = pairs.reset_index(drop=True)
+
+    if verbose:
+        print("\n" + "=" * 78)
+        print(f"ROUTING TRIGGERS — pairs with |corr| > {pair_threshold}")
+        print("=" * 78)
+        if pairs.empty:
+            print("None.")
+        else:
+            print(pairs.to_string(index=False))
+        cross_hi = pairs[(pairs["relation"] == "cross-dominio") & (pairs["corr"].abs() > cross_threshold)] if not pairs.empty else pairs
+        print(f"\nCross-domain collinearities > {cross_threshold} (flagged, NOT removed):")
+        if cross_hi.empty:
+            print("  None.")
+        else:
+            for _, row in cross_hi.iterrows():
+                print(f"  {row['feature_a']} ~ {row['feature_b']}  ({row['corr']})")
+            print("  -> deliberate (e.g. dxy_chg4w shared by USD & Oro with opposite reading).")
+        print(f"\nSaved heatmap -> {path}")
+    return pairs
+
+
+def routing_trigger_summary(triggers: pd.DataFrame, signif: float = 0.05) -> pd.DataFrame:
+    """ADF sanity check + per-domain summary of every routing trigger.
+
+    ``vix_level`` and the three MBS level filters are rule-based and excluded
+    from the statistical (ADF) test. Returns: trigger, domain, type (level vs
+    variation), stationary (yes/no/filter), n_obs.
+    """
+    rows = []
+    for dom in ("USD", "Oro", "MBS"):
+        for name in ROUTING_DOMAINS[dom]:
+            series = triggers[name].dropna()
+            if name in RULE_BASED_LEVELS:
+                stationary = "n/a (rule-based filter)"
+            else:
+                pvalue = adfuller(series, autolag="AIC")[1]
+                stationary = "yes" if pvalue < signif else "no"
+            rows.append(
+                {
+                    "trigger": name,
+                    "domain": dom,
+                    "type": TRIGGER_TYPE[name],
+                    "stationary": stationary,
+                    "n_obs": int(len(series)),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def build(verbose: bool = True) -> pd.DataFrame:
+    """Load, transform to stationarity, ADF-test, save parquet, return the df."""
+    df = load_dataset(verbose=verbose)
+    stationary = make_stationary(df)
+
+    table = adf_table(stationary)
+    if verbose:
+        print("\n" + "=" * 78)
+        print("AUGMENTED DICKEY-FULLER TEST — transformed features")
+        print("=" * 78)
+        with pd.option_context("display.max_rows", None, "display.width", 140):
+            print(table.to_string())
+        n_stat = int(table["stationary"].sum())
+        print(f"\nStationary at 5%: {n_stat}/{len(table)} features")
+        non_stat = table.index[~table["stationary"]].tolist()
+        if non_stat:
+            print(f"NOT stationary at 5%: {non_stat}")
+
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    stationary.to_parquet(OUTPUT_PATH)
+    if verbose:
+        print(f"\nSaved {stationary.shape[0]} x {stationary.shape[1]} -> {OUTPUT_PATH}")
+
+    # --- Engineered spreads ------------------------------------------------
+    spreads = build_spreads(df).dropna(axis=0, how="any")
+    spread_labels = {**SPREAD_KINDS, **STANDALONE_KINDS}
+    spread_labels.update({f"{k}_chg4w": "spread_chg4w" for k in SPREAD_KINDS})
+    spread_adf = adf_table(spreads, transform_map=spread_labels)
+    if verbose:
+        print("\n" + "=" * 78)
+        print("AUGMENTED DICKEY-FULLER TEST — engineered spreads")
+        print("=" * 78)
+        with pd.option_context("display.max_rows", None, "display.width", 140):
+            print(spread_adf.to_string())
+        n_stat = int(spread_adf["stationary"].sum())
+        print(f"\nStationary at 5%: {n_stat}/{len(spread_adf)} spreads")
+        non_stat = spread_adf.index[~spread_adf["stationary"]].tolist()
+        if non_stat:
+            print(f"NOT stationary at 5% (persistent levels, expected): {non_stat}")
+
+    spreads.to_parquet(SPREADS_PATH)
+    if verbose:
+        print(f"Saved {spreads.shape[0]} x {spreads.shape[1]} -> {SPREADS_PATH}")
+
+    # --- Redundancy: correlation heatmap (originals + spreads) ------------
+    redundant = correlation_heatmap(stationary, spreads)
+    if verbose:
+        print("\n" + "=" * 78)
+        print("REDUNDANCY — pairs with |corr| >= 0.90 (originals + spreads)")
+        print("=" * 78)
+        if redundant.empty:
+            print("None.")
+        else:
+            with pd.option_context("display.max_rows", None, "display.width", 120):
+                print(redundant.round(3).to_string(index=False))
+        print(f"\nSaved heatmap -> {FIG_DIR / 'feature_spread_correlation.png'}")
+    return stationary
+
+
+def build_routing(verbose: bool = True) -> pd.DataFrame:
+    """Prompt 3.1 pipeline: collinearity cleanup + routing triggers.
+
+    Step 1 drops collinear columns and writes ``*_clean.parquet``; Step 2 builds
+    the routing triggers and saves them; Step 3 produces the trigger
+    correlation matrix/heatmap; Step 4 runs the ADF sanity check.
+    """
+    if not (OUTPUT_PATH.exists() and SPREADS_PATH.exists()):
+        build(verbose=False)
+
+    df_raw = load_dataset(verbose=False)
+    df_stationary = pd.read_parquet(OUTPUT_PATH)
+    df_spreads = pd.read_parquet(SPREADS_PATH)
+
+    # --- Step 1: remove collinear features, save clean parquets -----------
+    stat_clean = remove_collinear_features(df_stationary, COLLINEAR_DROP)
+    spreads_clean = remove_collinear_features(df_spreads, COLLINEAR_DROP)
+    stat_clean.to_parquet(FEATURES_CLEAN_PATH)
+    spreads_clean.to_parquet(SPREADS_CLEAN_PATH)
+    if verbose:
+        print("=" * 78)
+        print("STEP 1 — collinearity cleanup (|corr| > 0.9)")
+        print("=" * 78)
+        dropped_stat = sorted(set(df_stationary.columns) - set(stat_clean.columns))
+        dropped_spr = sorted(set(df_spreads.columns) - set(spreads_clean.columns))
+        print(f"features_stationary: {df_stationary.shape[1]} -> {stat_clean.shape[1]} "
+              f"(dropped {dropped_stat})")
+        print(f"spreads            : {df_spreads.shape[1]} -> {spreads_clean.shape[1]} "
+              f"(dropped {dropped_spr})")
+        print(f"Saved -> {FEATURES_CLEAN_PATH}")
+        print(f"Saved -> {SPREADS_CLEAN_PATH}")
+
+    # --- Step 2: build routing triggers -----------------------------------
+    triggers = build_routing_triggers(df_raw, df_stationary, df_spreads)
+    triggers_clean = triggers.dropna(axis=0, how="any")
+    triggers_clean.to_parquet(ROUTING_PATH)
+    if verbose:
+        print("\n" + "=" * 78)
+        print("STEP 2 — routing triggers")
+        print("=" * 78)
+        print(f"{triggers.shape[1]} unique triggers | aligned obs: {len(triggers_clean)} "
+              f"({triggers_clean.index.min().date()} -> {triggers_clean.index.max().date()})")
+        print(f"Saved -> {ROUTING_PATH}")
+
+    # --- Step 3: correlation matrix + heatmap -----------------------------
+    routing_correlation(triggers, verbose=verbose)
+
+    # --- Step 4: ADF sanity check + summary -------------------------------
+    summary = routing_trigger_summary(triggers)
+    if verbose:
+        print("\n" + "=" * 78)
+        print("STEP 4 — ADF sanity check (rule-based level filters excluded)")
+        print("=" * 78)
+        print(summary.to_string(index=False))
+        tested = summary[summary["stationary"].isin(["yes", "no"])]
+        n_stat = int((tested["stationary"] == "yes").sum())
+        print(f"\nStationary at 5%: {n_stat}/{len(tested)} tested triggers")
+    return triggers_clean
+
+
+if __name__ == "__main__":
+    build()
+    print("\n")
+    build_routing()
