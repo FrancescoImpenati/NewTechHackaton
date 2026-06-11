@@ -1,16 +1,24 @@
-"""Stadio 1 della feature selection: ranking univariato del potere anomaly-detection.
+"""Feature selection for the 56-feature model set (stage 1: univariate ranking).
 
-Metodologia (coerente con la SHARED METHODOLOGY del PROJECT_HANDOFF):
-- per ogni fold walk-forward: mu/sigma stimati sui TRAIN NORMALS (Y==0) del fold
-  -> lo score univariato |z| e' di fatto "un MVG a una sola feature";
-- direzione (per le feature one-sided tipo VIX): segno scelto massimizzando l'AP
-  sul TRAIN del fold (mai sul val -> niente leakage), poi valutato sul val;
-- metrica: average precision (AUC-PR) sul fold val, la metrica onesta sotto sbilanciamento;
-- aggregazione cross-fold: media pesata per n_pos del val (fold 1-2 dominano, come da methodology);
-- equity_bond_corr_13w joinata da routing_triggers (la "57esima colonna" della methodology).
+Stage-1 methodology (consistent with the SHARED METHODOLOGY of the handoff):
+- per walk-forward fold: mu/sigma estimated on the fold's TRAIN NORMALS (Y==0)
+  -> the univariate |z| score is effectively "a single-feature MVG";
+- direction (for one-sided features like VIX): sign chosen by maximizing AP on
+  the fold TRAIN (never on the val -> no leakage), then evaluated on the val;
+- metric: average precision (AUC-PR) on the fold val, the honest metric under
+  class imbalance;
+- cross-fold aggregation: mean weighted by the val's n_pos (folds 1-2 dominate,
+  as per methodology);
+- equity_bond_corr_13w joined from routing_triggers (the "57th column" of the
+  methodology).
 
-Output: outputs/tables/feature_ranking_univariate.csv (eseguito dalla root del repo)
-        + conteggio dei cluster di correlazione sul development set (dimensiona lo stadio 2).
+Selection operates on the MODEL feature set only: ``vrp`` / ``jpy_strength``
+also exist as routing triggers (handoff §5.4) — routing is out of scope here,
+so any decision taken on the model copies leaves the routing engine untouched.
+
+Output: outputs/tables/feature_ranking_univariate.csv (run from the repo root:
+``python -m src.feature_selection``) + correlation-cluster counts on the
+development set (sizes stage 2).
 """
 from __future__ import annotations
 
@@ -22,7 +30,7 @@ from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import squareform
 from sklearn.metrics import average_precision_score
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 WF = ROOT / "data" / "processed" / "walkforward"
 TRIGGERS = ROOT / "data" / "processed" / "routing_triggers.parquet"
 OUT = ROOT / "outputs" / "tables" / "feature_ranking_univariate.csv"
@@ -81,8 +89,9 @@ def univariate_ranking() -> pd.DataFrame:
 
 
 def correlation_cluster_count(thresholds=(0.3, 0.4, 0.5)) -> dict[float, int]:
-    """Quanti cluster formano le feature sul development set (average linkage, d=1-|rho|).
-    Serve a dimensionare lo stadio 2 (clustered MDA): t=0.4 ~ |rho|>0.6 intra-cluster."""
+    """How many clusters the features form on the development set (average
+    linkage, d=1-|rho|). Sizes stage 2 (clustered MDA): t=0.4 ~ |rho|>0.6
+    intra-cluster."""
     corr13 = pd.read_parquet(TRIGGERS)[["equity_bond_corr_13w"]]
     dev = _load("development.parquet", corr13).drop(columns=[TARGET]).dropna()
     d = (1.0 - dev.corr().abs()).to_numpy().copy()
@@ -105,5 +114,5 @@ if __name__ == "__main__":
           formatters={c: "{:.3f}".format for c in ("AP_abs_w", "AP_dir_w", "AP_best_w", "lift_vs_random")}))
     probe = ["MXRU", "EONIA", "ECSURPUS", "BDIY", "libor_3m_spread_chg4w"]
     pos = {p: (rank.index[rank.feature == p][0] + 1) if (rank.feature == p).any() else None for p in probe}
-    print("\nposizione in classifica delle feature 'problematiche' per l'estensione dati:", pos)
-    print("\ncluster di correlazione sul development:", correlation_cluster_count())
+    print("\nranking position of the 'problematic-for-data-extension' features:", pos)
+    print("\ncorrelation clusters on the development set:", correlation_cluster_count())
