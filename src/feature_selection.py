@@ -1,4 +1,4 @@
-"""Feature selection for the 56-feature model set (stage 1: univariate ranking).
+"""Feature selection for the 56-feature model set (stages 1-2).
 
 Stage-1 methodology (consistent with the SHARED METHODOLOGY of the handoff):
 - per walk-forward fold: mu/sigma estimated on the fold's TRAIN NORMALS (Y==0)
@@ -34,6 +34,8 @@ ROOT = Path(__file__).resolve().parents[1]
 WF = ROOT / "data" / "processed" / "walkforward"
 TRIGGERS = ROOT / "data" / "processed" / "routing_triggers.parquet"
 OUT = ROOT / "outputs" / "tables" / "feature_ranking_univariate.csv"
+TABLES_DIR = ROOT / "outputs" / "tables"
+FIGURES_DIR = ROOT / "outputs" / "figures"
 FOLDS = (1, 2, 3, 4, 5)
 TARGET = "Y"
 
@@ -98,6 +100,171 @@ def correlation_cluster_count(thresholds=(0.3, 0.4, 0.5)) -> dict[float, int]:
     np.fill_diagonal(d, 0.0)
     Z = linkage(squareform(d, checks=False), method="average")
     return {t: int(fcluster(Z, t, criterion="distance").max()) for t in thresholds}
+
+
+# --------------------------------------------------------------------------
+# Stage 2 — correlation clusters + clustered permutation importance (WP2)
+# --------------------------------------------------------------------------
+def _development_matrix() -> pd.DataFrame:
+    """Enriched development matrix (56 features, no Y, warm-up NaNs dropped)."""
+    corr13 = pd.read_parquet(TRIGGERS)[["equity_bond_corr_13w"]]
+    return _load("development.parquet", corr13).drop(columns=[TARGET]).dropna()
+
+
+def correlation_clusters(threshold: float = 0.4, save: bool = True) -> pd.DataFrame:
+    """Hierarchical clustering of the 56 MODEL features on the development set.
+
+    Distance = 1 - |rho| (Pearson), average linkage, tree cut at ``threshold``
+    (t=0.4 ~ |rho|>0.6 intra-cluster). Returns a DataFrame
+    ``[feature, cluster_id]`` and persists it to feature_clusters.csv.
+
+    Note: selection operates on the MODEL feature set only. ``vrp`` and
+    ``jpy_strength`` are duplicated as routing triggers (handoff §5.4):
+    dropping their model copies leaves the routing engine untouched, so
+    routing is out of scope here.
+    """
+    dev = _development_matrix()
+    d = (1.0 - dev.corr().abs()).to_numpy().copy()
+    np.fill_diagonal(d, 0.0)
+    Z = linkage(squareform(d, checks=False), method="average")
+    labels = fcluster(Z, threshold, criterion="distance")
+    df = pd.DataFrame({"feature": dev.columns, "cluster_id": labels.astype(int)})
+    df = df.sort_values(["cluster_id", "feature"]).reset_index(drop=True)
+    if save:
+        TABLES_DIR.mkdir(parents=True, exist_ok=True)
+        df.to_csv(TABLES_DIR / "feature_clusters.csv", index=False)
+    return df
+
+
+def clustered_permutation_importance(clusters: pd.DataFrame | None = None,
+                                     n_repeats: int = 20, seed: int = 42,
+                                     save: bool = True, verbose: bool = True) -> pd.DataFrame:
+    """Cluster importance = drop in val AUC-PR of the soft-median ensemble when
+    all columns of the cluster are jointly row-shuffled in the val matrix.
+
+    Per fold the 4 detectors are fit ONCE (leakage-free: clone_unfit of the
+    production models + fresh per-fold scalers) and KEPT; permutation is
+    re-SCORING only, never re-fitting, and the reference (train-normal)
+    percentile distributions stay untouched. The same row permutation is
+    applied to every column of the cluster (joint shuffle preserves the
+    intra-cluster dependence structure). Drops are averaged over ``n_repeats``
+    seeded permutations per fold, then aggregated across folds with
+    n_pos weights (methodology contract).
+
+    Returns one row per cluster: members, mean_drop (n_pos-weighted),
+    std_drop (n_pos-weighted mean of the per-fold std over repeats) and the
+    per-fold mean drops. Baseline per-fold AUC-PRs are in ``df.attrs``.
+    """
+    from src.ensemble import MODEL_ORDER, clone_unfit, score_to_percentile
+    from src.models import weighted_mean
+    from src.preprocessing import FoldScaler
+    from src.sensitivity import load_model_folds, load_production_models
+    from sklearn.metrics import average_precision_score
+
+    clusters = clusters if clusters is not None else correlation_clusters()
+    cluster_members = {int(cid): list(g["feature"])
+                       for cid, g in clusters.groupby("cluster_id")}
+
+    data = load_model_folds()
+    folds = data["folds"]
+    production = load_production_models()
+    scaler = FoldScaler()
+    scaler.fit_per_fold(folds)
+    cols = scaler.feature_cols_
+    col_idx = {c: i for i, c in enumerate(cols)}
+
+    rng = np.random.default_rng(seed)
+    per_fold_mean: dict[int, dict[int, float]] = {}
+    per_fold_std: dict[int, dict[int, float]] = {}
+    base_ap: dict[int, float] = {}
+    n_pos: dict[int, int] = {}
+
+    for fold in folds:
+        fid, train, val = fold["fold_id"], fold["train"], fold["val"]
+        tn = train[train[TARGET] == 0]
+        Xtn = scaler.transform(tn, fid)
+        Xval = scaler.transform(val, fid)
+        y_val = val[TARGET].to_numpy()
+        n_val = len(val)
+
+        fitted, ref = {}, {}
+        for name in MODEL_ORDER:
+            fitted[name] = clone_unfit(production[name]).fit(Xtn)
+            ref[name] = fitted[name].score_samples(Xtn)
+
+        def ensemble_ap(X, n_blocks=1):
+            """soft-median ensemble AUC-PR; X may stack n_blocks copies of val."""
+            pct = np.array([score_to_percentile(ref[n], fitted[n].score_samples(X))
+                            for n in MODEL_ORDER])
+            ens = np.median(pct, axis=0)
+            if n_blocks == 1:
+                return [average_precision_score(y_val, ens)]
+            return [average_precision_score(y_val, b)
+                    for b in ens.reshape(n_blocks, n_val)]
+
+        base_ap[fid] = ensemble_ap(Xval)[0]
+        n_pos[fid] = int(y_val.sum())
+        per_fold_mean[fid], per_fold_std[fid] = {}, {}
+
+        for cid in sorted(cluster_members):
+            idx = [col_idx[c] for c in cluster_members[cid]]
+            blocks = []
+            for _ in range(n_repeats):
+                perm = rng.permutation(n_val)
+                Xp = Xval.copy()
+                Xp[:, idx] = Xval[perm][:, idx]
+                blocks.append(Xp)
+            aps = np.array(ensemble_ap(np.vstack(blocks), n_blocks=n_repeats))
+            drops = base_ap[fid] - aps
+            per_fold_mean[fid][cid] = float(drops.mean())
+            per_fold_std[fid][cid] = float(drops.std())
+        if verbose:
+            print(f"fold {fid}: baseline AUC-PR={base_ap[fid]:.3f}, "
+                  f"{len(cluster_members)} clusters x {n_repeats} repeats done")
+
+    fids = sorted(base_ap)
+    w = np.array([n_pos[f] for f in fids], dtype=float)
+    rows = []
+    for cid in sorted(cluster_members):
+        m = np.array([per_fold_mean[f][cid] for f in fids])
+        s = np.array([per_fold_std[f][cid] for f in fids])
+        rows.append({"cluster_id": cid,
+                     "members": "|".join(cluster_members[cid]),
+                     "n_members": len(cluster_members[cid]),
+                     "mean_drop": weighted_mean(m, w),
+                     "std_drop": weighted_mean(s, w),
+                     **{f"drop_fold_{f}": m[i] for i, f in enumerate(fids)}})
+    df = pd.DataFrame(rows).sort_values("mean_drop", ascending=False).reset_index(drop=True)
+    df.attrs["baseline_auc_pr_per_fold"] = base_ap
+    df.attrs["n_pos_per_fold"] = n_pos
+    if save:
+        TABLES_DIR.mkdir(parents=True, exist_ok=True)
+        df.to_csv(TABLES_DIR / "cluster_importance.csv", index=False)
+    return df
+
+
+def plot_cluster_importance(imp: pd.DataFrame, out_path: Path | None = None):
+    """Sorted horizontal bar chart of the n_pos-weighted mean AUC-PR drops."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    d = imp.sort_values("mean_drop", ascending=True)
+    labels = [f"C{int(r.cluster_id)}: " + (r.members if len(r.members) <= 38
+              else r.members[:35] + "...") for r in d.itertuples()]
+    fig, ax = plt.subplots(figsize=(9, 0.28 * len(d) + 1.5))
+    ax.barh(labels, d["mean_drop"], xerr=d["std_drop"], color="#3182bd",
+            error_kw={"elinewidth": 0.8, "alpha": 0.6})
+    ax.axvline(0, color="0.4", lw=0.8)
+    ax.set_xlabel("n_pos-weighted mean drop in val AUC-PR (soft-median ensemble)")
+    ax.set_title("Clustered permutation importance (joint shuffle, 20 repeats/fold)")
+    ax.tick_params(axis="y", labelsize=7)
+    fig.tight_layout()
+    out_path = out_path or FIGURES_DIR / "cluster_importance.png"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    return out_path
 
 
 if __name__ == "__main__":
