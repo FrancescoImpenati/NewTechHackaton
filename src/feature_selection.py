@@ -1,4 +1,4 @@
-"""Feature selection for the 56-feature model set (stages 1-2).
+"""Feature selection for the 56-feature model set (stages 1-3).
 
 Stage-1 methodology (consistent with the SHARED METHODOLOGY of the handoff):
 - per walk-forward fold: mu/sigma estimated on the fold's TRAIN NORMALS (Y==0)
@@ -261,6 +261,281 @@ def plot_cluster_importance(imp: pd.DataFrame, out_path: Path | None = None):
     ax.tick_params(axis="y", labelsize=7)
     fig.tight_layout()
     out_path = out_path or FIGURES_DIR / "cluster_importance.png"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    return out_path
+
+
+# --------------------------------------------------------------------------
+# Stage 3 — representatives, nested subset curve, freeze (WP3)
+# --------------------------------------------------------------------------
+# Tickers that are hard to source from free providers when extending the
+# dataset to 2022-2025 (handoff §7c): used only as a tie-break, never as a
+# hard exclusion.
+HARD_TO_EXTEND = {"MXRU", "EONIA", "ECSURPUS", "US0001M", "BDIY"}
+
+# Hypothesis-driven keep: always included in every subset, reported separately.
+HYPOTHESIS_KEPT = {
+    "equity_bond_corr_13w": "discriminates inflation-driven crises; regime "
+                            "absent in-sample; expected value is out-of-sample",
+}
+
+# Pre-registered knee rule (fixed BEFORE seeing the subset curve): smallest k
+# whose weighted-CV AUC-PR >= KNEE_FRACTION * max over all evaluated subsets.
+KNEE_FRACTION = 0.98
+
+
+def cluster_representatives(clusters: pd.DataFrame | None = None,
+                            ranking: pd.DataFrame | None = None,
+                            save: bool = True) -> pd.DataFrame:
+    """One representative per cluster = member with highest stage-1 AP_best_w.
+
+    Extendability tie-break: if the top member is in ``HARD_TO_EXTEND`` and the
+    runner-up is within 0.05 AP, take the runner-up. Every choice + reason is
+    recorded (cluster_representatives.csv).
+    """
+    clusters = clusters if clusters is not None else correlation_clusters()
+    ranking = ranking if ranking is not None else pd.read_csv(OUT)
+    ap = ranking.set_index("feature")["AP_best_w"]
+
+    rows = []
+    for cid, g in clusters.groupby("cluster_id"):
+        ranked = ap.reindex(g["feature"]).sort_values(ascending=False)
+        top, top_ap = ranked.index[0], float(ranked.iloc[0])
+        rep, rep_ap, reason = top, top_ap, "highest stage-1 AP_best_w"
+        if top in HARD_TO_EXTEND:
+            if len(ranked) > 1 and top_ap - float(ranked.iloc[1]) <= 0.05:
+                rep, rep_ap = ranked.index[1], float(ranked.iloc[1])
+                reason = (f"runner-up within 0.05 AP of hard-to-extend top "
+                          f"'{top}' (AP {top_ap:.3f} vs {rep_ap:.3f})")
+            else:
+                reason = ("hard-to-extend top kept: "
+                          + ("no runner-up in cluster" if len(ranked) == 1 else
+                             f"runner-up more than 0.05 AP behind ({top_ap - float(ranked.iloc[1]):.3f})"))
+        rows.append({"cluster_id": int(cid), "representative": rep,
+                     "AP_best_w": rep_ap, "top_member": top, "top_AP_best_w": top_ap,
+                     "reason": reason, "members": "|".join(g["feature"])})
+    df = pd.DataFrame(rows).sort_values("cluster_id").reset_index(drop=True)
+    if save:
+        TABLES_DIR.mkdir(parents=True, exist_ok=True)
+        df.to_csv(TABLES_DIR / "cluster_representatives.csv", index=False)
+    return df
+
+
+def _evaluate_subset(subset: list[str], folds: list[dict], production: dict) -> dict:
+    """Refit the 4 detectors per fold on a feature subset and tune the
+    soft-median ensemble tau exactly as the production code does.
+
+    A FRESH ``FoldScaler`` is constructed (``feature_cols_`` locks on first
+    call — handoff §7a). Per-model thresholds follow the production logic:
+    F1-optimal percentile threshold per fold (``_tune_threshold``) for
+    MVG/SVM/AE, the contamination-induced boundary (-offset_) for IF, then the
+    n_pos-weighted median across folds. Hyperparameters stay at the production
+    values (re-running the SVM/IF grids per subset is out of scope).
+    """
+    from src.ensemble import MODEL_ORDER, EnsembleDetector, clone_unfit
+    from src.models import _tune_threshold, weighted_median
+    from src.preprocessing import FoldScaler
+
+    cols = subset + [TARGET]
+    sub_folds = [{"fold_id": f["fold_id"], "train": f["train"][cols],
+                  "val": f["val"][cols]} for f in folds]
+    scaler = FoldScaler()
+    scaler.fit_per_fold(sub_folds)
+
+    fold_scores: dict[int, dict] = {}
+    eps_per_model: dict[str, list] = {n: [] for n in MODEL_ORDER}
+    n_pos_list = []
+    for f in sub_folds:
+        fid, train, val = f["fold_id"], f["train"], f["val"]
+        tn = train[train[TARGET] == 0]
+        Xtn, Xval = scaler.transform(tn, fid), scaler.transform(val, fid)
+        y_val = val[TARGET].to_numpy()
+        ref, valsc = {}, {}
+        for name in MODEL_ORDER:
+            fm = clone_unfit(production[name]).fit(Xtn)
+            ref[name] = fm.score_samples(Xtn)
+            valsc[name] = fm.score_samples(Xval)
+            if name == "if":
+                eps = float(-fm.model_.offset_)  # contamination boundary
+            else:
+                eps, _ = _tune_threshold(ref[name], valsc[name], y_val)
+            eps_per_model[name].append(eps)
+        n_pos_list.append(int(y_val.sum()))
+        fold_scores[fid] = {"ref": ref, "val": valsc, "thr": {}}
+
+    w = np.array(n_pos_list, dtype=float)
+    thr = {n: weighted_median(np.array(eps_per_model[n]), w) for n in MODEL_ORDER}
+    for fid in fold_scores:
+        fold_scores[fid]["thr"] = dict(thr)
+
+    ens = EnsembleDetector("soft_median", production, {n: scaler for n in MODEL_ORDER})
+    ens.fit_threshold_walkforward(sub_folds, fold_scores=fold_scores)
+    summary = ens.weighted_summary()
+    return {"tau": float(ens.threshold_), "summary": summary,
+            "per_fold": ens.walkforward_results_, "model_thresholds": thr}
+
+
+def subset_curve(ks=(8, 12, 16, 20, 26, 36), importance: pd.DataFrame | None = None,
+                 representatives: pd.DataFrame | None = None,
+                 save: bool = True, verbose: bool = True) -> pd.DataFrame:
+    """Nested subset curve: for each k, subset = representatives of the top-k
+    clusters by WP2 importance ∪ HYPOTHESIS_KEPT; plus k='ALL' (full 56)."""
+    from src.sensitivity import load_model_folds, load_production_models
+    import time
+
+    importance = (importance if importance is not None
+                  else pd.read_csv(TABLES_DIR / "cluster_importance.csv"))
+    representatives = (representatives if representatives is not None
+                       else cluster_representatives())
+    rep_of = representatives.set_index("cluster_id")["representative"]
+    ranked_clusters = importance.sort_values("mean_drop", ascending=False)["cluster_id"]
+
+    data = load_model_folds()
+    folds = data["folds"]
+    production = load_production_models()
+    all_features = [c for c in folds[0]["val"].columns if c != TARGET]
+
+    rows = []
+    for k in list(ks) + ["ALL"]:
+        if k == "ALL":
+            subset = list(all_features)
+        else:
+            reps = [rep_of[cid] for cid in ranked_clusters.head(k)]
+            subset = sorted(set(reps) | set(HYPOTHESIS_KEPT))
+        t0 = time.time()
+        res = _evaluate_subset(subset, folds, production)
+        s = res["summary"]
+        rows.append({"k": k, "n_features": len(subset),
+                     "AUC_PR_wCV": s["AUC_PR"], "F2_wCV": s["F_beta_2"],
+                     "F1_wCV": s["F1"], "precision_wCV": s["Precision"],
+                     "recall_wCV": s["Recall"], "AUC_ROC_wCV": s["AUC_ROC"],
+                     "tau_k": res["tau"],
+                     "hypothesis_kept": "|".join(sorted(HYPOTHESIS_KEPT)),
+                     "features": "|".join(subset)})
+        if verbose:
+            print(f"k={k!s:>3}: {len(subset):>2} features, AUC-PR_wCV={s['AUC_PR']:.3f}, "
+                  f"F2_wCV={s['F_beta_2']:.3f}, tau={res['tau']:.4f} "
+                  f"({time.time() - t0:.0f}s)")
+    df = pd.DataFrame(rows)
+    if save:
+        TABLES_DIR.mkdir(parents=True, exist_ok=True)
+        df.to_csv(TABLES_DIR / "subset_curve.csv", index=False)
+    return df
+
+
+def freeze_selected_features(curve: pd.DataFrame, save: bool = True) -> dict:
+    """Apply the pre-registered knee rule (smallest k with weighted-CV AUC-PR
+    >= 0.98 x the max over all evaluated subsets, k='ALL' included) and freeze
+    the selected list to outputs/tables/selected_features.json."""
+    import json
+
+    target = KNEE_FRACTION * curve["AUC_PR_wCV"].max()
+    finite = curve[curve["k"] != "ALL"].copy()
+    finite["k_int"] = finite["k"].astype(int)
+    ok = finite[finite["AUC_PR_wCV"] >= target].sort_values("k_int")
+    chosen = ok.iloc[0] if len(ok) else curve[curve["k"] == "ALL"].iloc[0]
+    feats = chosen["features"].split("|")
+    selected = {
+        "data_driven": [f for f in feats if f not in HYPOTHESIS_KEPT],
+        "hypothesis": sorted(HYPOTHESIS_KEPT),
+        "k": int(chosen["k"]) if chosen["k"] != "ALL" else "ALL",
+        "tau": float(chosen["tau_k"]),
+        "knee_rule": f"smallest k with AUC_PR_wCV >= {KNEE_FRACTION} * max "
+                     f"(threshold {target:.4f})",
+    }
+    if save:
+        TABLES_DIR.mkdir(parents=True, exist_ok=True)
+        with open(TABLES_DIR / "selected_features.json", "w") as f:
+            json.dump(selected, f, indent=2)
+    return selected
+
+
+def evaluate_frozen_on_holdout(selected: dict, save: bool = True) -> pd.DataFrame:
+    """THE single sealed-holdout evaluation (end of WP3).
+
+    Frozen subset: dev-fit scaler + dev-fit models restricted to the subset,
+    same inference path as handoff §2 (percentile vs dev-normal reference ->
+    soft median -> frozen tau). Side-by-side with the full-56 production row
+    (saved final models via the WP1 final-path cache, production tau).
+    No iteration afterwards: underperformance is a finding, not a fix.
+    """
+    from src.ensemble import MODEL_ORDER, clone_unfit, score_to_percentile
+    from src.models import compute_metrics
+    from src.preprocessing import FoldScaler
+    from src.sensitivity import (PRODUCTION_TAU, load_final_path,
+                                 load_model_folds, load_production_models)
+
+    data = load_model_folds()
+    test = data["test"]
+    y_test = test[TARGET].to_numpy()
+    production = load_production_models()
+
+    subset = sorted(set(selected["data_driven"]) | set(selected["hypothesis"]))
+    cols = subset + [TARGET]
+    scaler = FoldScaler()
+    scaler.fit_on_development(data["dev"][cols])
+    Xdn = scaler.transform_holdout(data["dev_normals"][cols])
+    Xte = scaler.transform_holdout(test[cols])
+
+    pct = []
+    for name in MODEL_ORDER:
+        fm = clone_unfit(production[name]).fit(Xdn)
+        pct.append(score_to_percentile(fm.score_samples(Xdn), fm.score_samples(Xte)))
+    ens_frozen = np.median(np.array(pct), axis=0)
+    pred_frozen = (ens_frozen >= selected["tau"]).astype(int)
+
+    final = load_final_path()  # full-56 production path (saved dev-fit models)
+    pct_full = np.array([score_to_percentile(final["ref"][n], final["holdout"][n])
+                         for n in MODEL_ORDER])
+    ens_full = np.median(pct_full, axis=0)
+    pred_full = (ens_full >= PRODUCTION_TAU).astype(int)
+
+    rows = [
+        {"subset": f"frozen_k{selected['k']}", "n_features": len(subset),
+         "tau": selected["tau"], "n_flagged": int(pred_frozen.sum()),
+         **compute_metrics(y_test, pred_frozen, ens_frozen)},
+        {"subset": "full_56", "n_features": 56, "tau": PRODUCTION_TAU,
+         "n_flagged": int(pred_full.sum()),
+         **compute_metrics(y_test, pred_full, ens_full)},
+    ]
+    df = pd.DataFrame(rows)
+    if save:
+        TABLES_DIR.mkdir(parents=True, exist_ok=True)
+        df.to_csv(TABLES_DIR / "holdout_frozen_vs_full.csv", index=False)
+    return df
+
+
+def plot_subset_curve(curve: pd.DataFrame, selected: dict,
+                      out_path: Path | None = None):
+    """Metric-vs-k curve with the pre-registered knee annotated."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    d = curve.copy()
+    d["x"] = [int(k) if k != "ALL" else 56 for k in d["k"]]
+    d = d.sort_values("x")
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    for metric, color in (("AUC_PR_wCV", "#3182bd"), ("F2_wCV", "#1a9850"),
+                          ("F1_wCV", "#7b3294")):
+        ax.plot(d["x"], d[metric], "o-", color=color, label=metric)
+    thr = KNEE_FRACTION * d["AUC_PR_wCV"].max()
+    ax.axhline(thr, color="#3182bd", ls=":", lw=1,
+               label=f"{KNEE_FRACTION} x max AUC-PR")
+    kx = selected["k"] if selected["k"] != "ALL" else 56
+    ax.axvline(kx, color="#d73027", ls="--", lw=1.4,
+               label=f"knee: k={selected['k']} (n={len(selected['data_driven']) + len(selected['hypothesis'])} feats, "
+                     f"tau={selected['tau']:.3f})")
+    ax.set_xticks(d["x"])
+    ax.set_xticklabels(d["k"])
+    ax.set_xlabel("k (top clusters by WP2 importance; ALL = full 56)")
+    ax.set_ylabel("n_pos-weighted CV metric")
+    ax.set_title("Nested subset curve (per-subset tau re-tuning, soft-median ensemble)")
+    ax.legend(fontsize=9)
+    fig.tight_layout()
+    out_path = out_path or FIGURES_DIR / "subset_curve.png"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=200)
     plt.close(fig)
