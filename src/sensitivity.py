@@ -330,6 +330,195 @@ def plot_tau_curve(curve: pd.DataFrame, metric: str = "F1",
     return out_path
 
 
+# --------------------------------------------------------------------------
+# WP4 — hyperparameter x tau surfaces (full 56 set; AE excluded)
+# --------------------------------------------------------------------------
+SVM_NU_GRID = [0.05, 0.10, 0.15, 0.22]
+IF_CONTAMINATION_GRID = [0.05, 0.10, 0.15, 0.22]
+PRODUCTION_SVM = {"nu": 0.10, "gamma": 0.001}
+PRODUCTION_IF_CONTAMINATION = 0.10
+
+
+def hyperparam_tau_surface(model: str, grid: list | None = None,
+                           taus: np.ndarray = TAU_GRID,
+                           fold_scores: dict | None = None,
+                           save: bool = True, verbose: bool = True) -> pd.DataFrame:
+    """Single-model hyperparameter x tau surface (n_pos-weighted F2 + AUC-PR).
+
+    ``model`` is "svm" (nu grid, gamma fixed at the production 0.001) or "if"
+    (contamination grid). Per hyperparameter value and fold, raw val scores are
+    mapped to percentiles vs the fold train-normal reference and thresholded at
+    each tau; F2 is aggregated n_pos-weighted across folds. AUC-PR (threshold-
+    free) is computed on the RAW val scores — the percentile map collapses all
+    val scores above the reference max into ties at 1.0, which distorts AP;
+    raw-score AP matches the models_comparison.csv convention. The AE is
+    excluded from surfaces (cost + nondeterminism).
+
+    Cache reuse: the production combo (svm nu=0.10/gamma=0.001) reuses the WP1
+    cached scores. IF ``score_samples`` is contamination-invariant with fixed
+    random_state (handoff §1.9.4) — contamination only moves the operating
+    point, never the scores — so ALL contamination rows reuse the cached
+    scores; the invariance is asserted by refitting fold 1 at the first
+    non-production value.
+    """
+    from sklearn.metrics import average_precision_score
+
+    assert model in ("svm", "if")
+    fold_scores = fold_scores or load_fold_scores()
+    grid = grid if grid is not None else (SVM_NU_GRID if model == "svm"
+                                          else IF_CONTAMINATION_GRID)
+    fids = sorted(fold_scores)
+    y = {fid: fold_scores[fid]["y_val"] for fid in fids}
+    w = np.array([y[fid].sum() for fid in fids], dtype=float)
+
+    # Per-hyperparameter raw + percentile val scores ({h: {fid: array}}).
+    raw_scores: dict[float, dict[int, np.ndarray]] = {}
+    pct_scores: dict[float, dict[int, np.ndarray]] = {}
+    needs_refit = (model == "svm")
+    if needs_refit:
+        data = load_model_folds()
+        scaler = FoldScaler()
+        scaler.fit_per_fold(data["folds"])
+    for h in grid:
+        if model == "if" or (model == "svm" and h == PRODUCTION_SVM["nu"]):
+            raw_scores[h] = {fid: fold_scores[fid]["val"][model] for fid in fids}
+            pct_scores[h] = {fid: score_to_percentile(fold_scores[fid]["ref"][model],
+                                                      fold_scores[fid]["val"][model])
+                             for fid in fids}
+        else:
+            raw_scores[h], pct_scores[h] = {}, {}
+            for fold in data["folds"]:
+                fid = fold["fold_id"]
+                tn = fold["train"][fold["train"]["Y"] == 0]
+                det = OneClassSVMDetector(nu=h, gamma=PRODUCTION_SVM["gamma"]).fit(
+                    scaler.transform(tn, fid))
+                ref = det.score_samples(scaler.transform(tn, fid))
+                val = det.score_samples(scaler.transform(fold["val"], fid))
+                raw_scores[h][fid] = val
+                pct_scores[h][fid] = score_to_percentile(ref, val)
+            if verbose:
+                print(f"svm nu={h}: refit 5 folds")
+
+    if model == "if":
+        # Assert score invariance once (fold 1, first non-production value).
+        data = load_model_folds()
+        scaler = FoldScaler()
+        scaler.fit_per_fold(data["folds"])
+        fold1 = data["folds"][0]
+        tn = fold1["train"][fold1["train"]["Y"] == 0]
+        c_alt = next(c for c in grid if c != PRODUCTION_IF_CONTAMINATION)
+        det = IsolationForestDetector(contamination=c_alt).fit(scaler.transform(tn, 1))
+        val_alt = det.score_samples(scaler.transform(fold1["val"], 1))
+        assert np.allclose(val_alt, fold_scores[1]["val"]["if"]), \
+            "IF score_samples is NOT contamination-invariant — surface must refit"
+        if verbose:
+            print(f"IF invariance asserted: contamination={c_alt} scores == cached "
+                  f"(max abs diff {np.max(np.abs(val_alt - fold_scores[1]['val']['if'])):.2e})")
+
+    from sklearn.metrics import fbeta_score
+    rows = []
+    for h in grid:
+        aucpr = weighted_mean(np.array(
+            [average_precision_score(y[fid], raw_scores[h][fid]) for fid in fids]), w)
+        for tau in taus:
+            f2 = weighted_mean(np.array(
+                [fbeta_score(y[fid], (pct_scores[h][fid] >= tau).astype(int),
+                             beta=2, zero_division=0) for fid in fids]), w)
+            rows.append({"model": model, "hyperparam": h, "tau": float(tau),
+                         "F2_w": f2, "AUC_PR_w": aucpr})
+    df = pd.DataFrame(rows)
+    if save:
+        TABLES_DIR.mkdir(parents=True, exist_ok=True)
+        name = "svm_nu_tau_surface" if model == "svm" else "if_contamination_tau_surface"
+        df.to_csv(TABLES_DIR / f"{name}.csv", index=False)
+    return df
+
+
+def plot_hyperparam_tau_surface(surface: pd.DataFrame, model: str,
+                                out_path: Path | None = None):
+    """Heatmap hyperparam x tau of weighted F2 + side column of weighted AUC-PR."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    hname = "nu" if model == "svm" else "contamination"
+    prod = PRODUCTION_SVM["nu"] if model == "svm" else PRODUCTION_IF_CONTAMINATION
+    piv = surface.pivot(index="hyperparam", columns="tau", values="F2_w")
+    aucpr = surface.groupby("hyperparam")["AUC_PR_w"].first()
+
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(12.5, 3.6), width_ratios=[12, 1.2])
+    im = ax.imshow(piv.to_numpy(), cmap="viridis", aspect="auto",
+                   extent=[piv.columns.min(), piv.columns.max(), len(piv) - 0.5, -0.5])
+    ax.set_yticks(range(len(piv)), [str(i) for i in piv.index])
+    ax.axvline(PRODUCTION_TAU, color="#d73027", ls="--", lw=1.3)
+    ax.plot([], [], color="#d73027", ls="--", label=f"production tau={PRODUCTION_TAU:.3f}")
+    prod_row = list(piv.index).index(prod)
+    ax.plot(piv.columns.min(), prod_row, marker=">", color="#d73027", clip_on=False)
+    ax.set_xlabel("tau")
+    ax.set_ylabel(hname)
+    ax.set_title(f"{model.upper()}: n_pos-weighted F2 ({hname} x tau); "
+                 f"arrow = production {hname}={prod}")
+    ax.legend(loc="lower left", fontsize=8)
+    fig.colorbar(im, ax=ax, label="F2_w")
+
+    im2 = ax2.imshow(aucpr.to_numpy().reshape(-1, 1), cmap="magma", aspect="auto")
+    ax2.set_yticks(range(len(aucpr)), [str(i) for i in aucpr.index])
+    ax2.set_xticks([])
+    ax2.set_title("AUC-PR_w", fontsize=9)
+    for i, v in enumerate(aucpr.to_numpy()):
+        ax2.text(0, i, f"{v:.3f}", ha="center", va="center", color="white", fontsize=8)
+    fig.tight_layout()
+    name = "svm_nu_tau_surface" if model == "svm" else "if_contamination_tau_surface"
+    out_path = out_path or FIGURES_DIR / f"{name}.png"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    return out_path
+
+
+# --------------------------------------------------------------------------
+# WP4 — inputs for the routing-threshold grid (reuses the WP1 cache)
+# --------------------------------------------------------------------------
+def routing_inputs(fold_scores: dict | None = None, tau: float = PRODUCTION_TAU) -> dict:
+    """Assemble the inputs of ``optimize_routing_thresholds`` from committed
+    artifacts + the WP1 cache (no model refits).
+
+    Ensemble flags per fold = soft-median percentile of the cached fold scores
+    thresholded at the production tau; sub-scores and routing fold-vals are the
+    committed parquets; prices/TC replicate the notebook-07 setup.
+    """
+    from src.data_loader import load_dataset
+
+    fold_scores = fold_scores or load_fold_scores()
+    data = load_model_folds()
+
+    raw = load_dataset(verbose=False)
+    prices = pd.DataFrame(index=raw.index)
+    prices["equity"] = raw[["MXUS", "MXEU", "MXJP"]].pct_change().mean(axis=1)
+    prices["bond"] = raw["LUACTRUU"].pct_change()
+    prices["gold"] = raw["XAUBGNL"].pct_change()
+    prices["cash"] = (raw["USGG3M"] / 100.0) / 52.0
+    prices["mbs"] = raw["LMBITR"].pct_change()
+    tc = {"equity": 5, "bond": 5, "gold": 8, "cash": 2, "mbs": 20}
+
+    ens_pct = _ensemble_val_percentiles(fold_scores, "soft_median")
+    sub_dir = ROOT / "data" / "processed" / "subscores" / "folds"
+    wf_dir = ROOT / "data" / "processed" / "walkforward"
+    ensemble_per_fold, subscores_per_fold, folds_routing, y_per_fold = {}, {}, {}, {}
+    for fold in data["folds"]:
+        fid, val = fold["fold_id"], fold["val"]
+        ensemble_per_fold[fid] = pd.Series((ens_pct[fid] >= tau).astype(int),
+                                           index=val.index)
+        y_per_fold[fid] = val["Y"]
+        subscores_per_fold[fid] = pd.read_parquet(
+            sub_dir / f"fold_{fid}_val.parquet").set_index("date_index")
+        folds_routing[fid] = pd.read_parquet(wf_dir / f"routing_fold_{fid}_val.parquet")
+    return {"ensemble_per_fold": ensemble_per_fold,
+            "subscores_per_fold": subscores_per_fold,
+            "folds_routing": folds_routing, "y_per_fold": y_per_fold,
+            "prices": prices, "tc": tc}
+
+
 if __name__ == "__main__":
     fs = cache_fold_scores()
     t0 = time.time()

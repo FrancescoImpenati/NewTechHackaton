@@ -1,0 +1,5 @@
+objective,best_usd,best_oro,best_value,"prod_value_at_(1.5,0.5)",prod_rank_of_25,n_tied_at_best,prod_survives
+calmar_wmedian,1.5,0.5,-0.07276052701590494,-0.07276052701590494,1,1,True
+sortino_wmedian,1.5,0.5,-0.05182247973402337,-0.05182247973402337,1,1,True
+cost_C,0.5,0.5,4.010000000000001,4.010000000000001,21,25,True
+calmar_concat,1.5,0.5,-0.021421767930395904,-0.021421767930395904,1,1,True
