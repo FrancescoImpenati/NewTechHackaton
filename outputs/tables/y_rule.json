@@ -75,5 +75,34 @@
   },
   "n_obs": 1111,
   "y_prevalence": 0.2133,
-  "note": "match below 97%: NO 2022-2025 labels fabricated; awaiting operator-confirmed ex-ante stress windows as the fallback."
+  "note": "match below 97%: NO 2022-2025 labels fabricated; awaiting operator-confirmed ex-ante stress windows as the fallback.",
+  "confirmed_fallback": {
+    "method": "ex_ante_windows_or_vix_floor",
+    "decided": "2026-06-16 (operator-confirmed after WP1 STOP gate)",
+    "windows": [
+      {
+        "name": "2022 inflation bear",
+        "start": "2022-01-03",
+        "end": "2022-10-21"
+      },
+      {
+        "name": "SVB / banking stress",
+        "start": "2023-03-06",
+        "end": "2023-05-01"
+      },
+      {
+        "name": "carry unwind",
+        "start": "2024-07-29",
+        "end": "2024-08-16"
+      },
+      {
+        "name": "tariff shock",
+        "start": "2025-04-02",
+        "end": "2025-05-09"
+      }
+    ],
+    "vix_floor": 30.0,
+    "rule": "Y=1 if week in any window OR weekly VIX close >= vix_floor; else 0",
+    "applies_to": "2022-2025 extension only; 2000-2021 keeps the shipped Y"
+  }
 }

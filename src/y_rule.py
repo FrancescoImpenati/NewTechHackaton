@@ -44,6 +44,32 @@ Y_RULE_PATH = TABLES_DIR / "y_rule.json"
 DM_EQUITY = ["MXUS", "MXEU", "MXJP"]      # developed-market basket
 WEEKS_PER_YEAR = 52
 
+# --------------------------------------------------------------------------
+# Operator-confirmed ex-ante fallback (used because the WP1 search failed the
+# 97% gate). Decision recorded 2026-06-16: label a 2022-2025 week risk-off if
+# it falls inside any public stress window OR weekly VIX closes >= 30. These
+# windows are ex-ante public episodes, NOT fitted to any model.
+EX_ANTE_WINDOWS: list[tuple[str, str, str]] = [
+    ("2022 inflation bear", "2022-01-03", "2022-10-21"),
+    ("SVB / banking stress", "2023-03-06", "2023-05-01"),
+    ("carry unwind", "2024-07-29", "2024-08-16"),
+    ("tariff shock", "2025-04-02", "2025-05-09"),
+]
+VIX_FLOOR = 30.0
+
+
+def label_ex_ante(index: pd.DatetimeIndex, vix_weekly: pd.Series) -> pd.Series:
+    """Operator-confirmed fallback labels for the 2022-2025 extension.
+
+    Y=1 when the week sits inside any ``EX_ANTE_WINDOWS`` range OR weekly VIX
+    closes >= ``VIX_FLOOR``. ``vix_weekly`` must be aligned to ``index``.
+    """
+    in_window = pd.Series(False, index=index)
+    for _, start, end in EX_ANTE_WINDOWS:
+        in_window |= (index >= pd.Timestamp(start)) & (index <= pd.Timestamp(end))
+    vix_hit = vix_weekly.reindex(index) >= VIX_FLOOR
+    return (in_window | vix_hit.fillna(False)).astype(int)
+
 # Grids (kept explicit so the search is fully auditable / reproducible).
 DD_WINDOWS = [8, 13, 26, 52]
 DD_DEPTHS = np.round(np.arange(0.04, 0.40, 0.01), 2)
