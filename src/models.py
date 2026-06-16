@@ -7,8 +7,15 @@ baseline with mandatory Ledoit-Wolf shrinkage of the covariance.
 """
 from __future__ import annotations
 
+import os
 import pickle
 from pathlib import Path
+
+# Reduce AE run-to-run drift (handoff §5.3). Must be set before tensorflow is
+# imported anywhere; the AE imports TF lazily, so module-import time is early
+# enough. setdefault keeps any explicit user override.
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+os.environ.setdefault("TF_DETERMINISTIC_OPS", "1")
 
 import numpy as np
 import pandas as pd

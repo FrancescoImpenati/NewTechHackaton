@@ -1,0 +1,23 @@
+{
+  "model_order": [
+    "mvg",
+    "svm",
+    "ae",
+    "if"
+  ],
+  "n_val_rows": {
+    "1": 153,
+    "2": 152,
+    "3": 101,
+    "4": 100,
+    "5": 100
+  },
+  "build_seconds": 112.7,
+  "max_abs_diff_vs_ensemble_meta_refs": {
+    "mvg": 0.0,
+    "svm": 1.4210854715202004e-14,
+    "ae": 1.4586392582671692e-07,
+    "if": 1.1102230246251565e-16
+  },
+  "note": "fold refits via clone_unfit + fresh FoldScaler; final path via saved models + scaler_final.pkl"
+}

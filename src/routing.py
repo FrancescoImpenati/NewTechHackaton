@@ -143,24 +143,53 @@ class RoutingEngine:
 def optimize_routing_thresholds(folds_data, ensemble_per_fold, subscores_per_fold,
                                 prices, tc_dict,
                                 usd_grid=(0.5, 0.75, 1.0, 1.25, 1.5),
-                                oro_grid=(0.5, 0.75, 1.0, 1.25, 1.5)):
-    """Grid-search (usd, oro) thresholds; score each combo by the **duration-
-    weighted median** Calmar across the fold validation windows.
+                                oro_grid=(0.5, 0.75, 1.0, 1.25, 1.5),
+                                objective: str = "calmar_wmedian",
+                                y_per_fold=None):
+    """Grid-search (usd, oro) thresholds under a configurable objective.
+
+    ``objective`` in {"calmar_wmedian", "sortino_wmedian", "cost_C",
+    "calmar_concat"}; the default reproduces the original behavior exactly
+    (duration-weighted median Calmar across the fold validation windows,
+    higher = better).
+
+    * ``sortino_wmedian`` — duration-weighted median of the per-fold Sortino
+      (annualized, rf=0) of the net weekly strategy returns.
+    * ``cost_C`` — C = 0.10*n_FN + 0.005*n_FP of the binary **ensemble flags**
+      vs Y within the fold vals (lower = better). Requires ``y_per_fold``
+      (fold_id -> label series aligned to ``ensemble_per_fold``). Note: the
+      ensemble flag does not depend on (usd, oro), so this objective is flat
+      across the grid by construction — it measures the detector, not the
+      router (see handoff §5.1 on weak identification).
+    * ``calmar_concat`` — Calmar on the equity path of the **concatenated**
+      fold-val net returns (one compounded path instead of a per-fold median).
 
     ``folds_data`` maps fold_id -> routing fold-val DataFrame (needs dxy_chg4w);
     ``ensemble_per_fold`` maps fold_id -> binary ensemble signal series;
     ``subscores_per_fold`` maps fold_id -> DataFrame(subscore_usd/oro/mbs);
     ``prices`` is the weekly per-asset returns DataFrame. Returns
-    (best_thresholds, grid_results_df)."""
-    from src.backtest import backtest_strategy
+    (best_thresholds, grid_results_df) with the objective as grid column."""
+    from src.backtest import WEEKS_PER_YEAR, backtest_strategy
     from src.models import weighted_median
+
+    valid = ("calmar_wmedian", "sortino_wmedian", "cost_C", "calmar_concat")
+    if objective not in valid:
+        raise ValueError(f"objective must be one of {valid}, got {objective!r}")
+    if objective == "cost_C" and y_per_fold is None:
+        raise ValueError("objective='cost_C' requires y_per_fold")
+
+    def _calmar(ec, n_weeks):
+        cagr = ec.iloc[-1] ** (WEEKS_PER_YEAR / n_weeks) - 1.0
+        maxdd = (ec / ec.cummax() - 1.0).min()
+        return cagr / abs(maxdd) if maxdd < 0 else np.nan
 
     engine = RoutingEngine()
     rows = []
     for u in usd_grid:
         for o in oro_grid:
             th = {"usd": u, "oro": o}
-            calmars, weeks = [], []
+            per_fold_vals, weeks, nets = [], [], []
+            cost = 0.0
             for fid, fold_df in folds_data.items():
                 idx = fold_df.index
                 sig = pd.DataFrame({
@@ -175,18 +204,39 @@ def optimize_routing_thresholds(folds_data, ensemble_per_fold, subscores_per_fol
                 res = backtest_strategy(w, prices.reindex(idx), tc_dict)
                 ec, net = res["equity_curve"], res["net"]
                 m = len(net)
-                cagr = ec.iloc[-1] ** (52 / m) - 1.0
-                maxdd = (ec / ec.cummax() - 1.0).min()
-                calmar = cagr / abs(maxdd) if maxdd < 0 else np.nan
-                calmars.append(calmar)
                 weeks.append(m)
-            cal = np.array(calmars, dtype=float)
-            wk = np.array(weeks, dtype=float)
-            ok = ~np.isnan(cal)
-            med = weighted_median(cal[ok], wk[ok]) if ok.any() else np.nan
-            rows.append({"usd": u, "oro": o, "calmar_wmedian": med})
+                nets.append(net)
+                if objective == "calmar_wmedian":
+                    per_fold_vals.append(_calmar(ec, m))
+                elif objective == "sortino_wmedian":
+                    downside = np.sqrt(np.mean(np.clip(net.to_numpy(), None, 0.0) ** 2))
+                    per_fold_vals.append(
+                        float(net.mean() * WEEKS_PER_YEAR
+                              / (downside * np.sqrt(WEEKS_PER_YEAR)))
+                        if downside > 0 else np.nan)
+                elif objective == "cost_C":
+                    flags = pd.Series(ensemble_per_fold[fid], index=idx)
+                    y = y_per_fold[fid].reindex(idx)
+                    ok = y.notna()
+                    n_fn = int(((y == 1) & (flags == 0) & ok).sum())
+                    n_fp = int(((y == 0) & (flags == 1) & ok).sum())
+                    cost += 0.10 * n_fn + 0.005 * n_fp
+
+            if objective in ("calmar_wmedian", "sortino_wmedian"):
+                vals = np.array(per_fold_vals, dtype=float)
+                wk = np.array(weeks, dtype=float)
+                ok = ~np.isnan(vals)
+                score = weighted_median(vals[ok], wk[ok]) if ok.any() else np.nan
+            elif objective == "calmar_concat":
+                concat = pd.concat(nets).reset_index(drop=True)
+                ec = (1.0 + concat).cumprod()
+                score = _calmar(ec, len(concat))
+            else:  # cost_C
+                score = cost
+            rows.append({"usd": u, "oro": o, objective: score})
 
     grid = pd.DataFrame(rows)
-    best = grid.loc[grid["calmar_wmedian"].idxmax()]
+    pick = grid[objective].idxmin() if objective == "cost_C" else grid[objective].idxmax()
+    best = grid.loc[pick]
     best_thresholds = {"usd": float(best["usd"]), "oro": float(best["oro"])}
     return best_thresholds, grid
