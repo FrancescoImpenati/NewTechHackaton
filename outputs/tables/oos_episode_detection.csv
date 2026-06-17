@@ -1,0 +1,5 @@
+episode,start,end,n_weeks,n_flagged,coverage,detected,first_flag,lead_lag_weeks_vs_start,peak_ens,dominant_model,mean_pct_mvg,mean_pct_svm,mean_pct_ae,mean_pct_if
+2022 inflation bear,2022-01-03,2022-10-21,42,13,0.31,True,2022-03-01,8,1.0,mvg,0.884,0.781,0.845,0.855
+SVB / banking stress,2023-03-06,2023-05-01,8,2,0.25,True,2023-03-14,1,0.9772,ae,0.844,0.813,0.856,0.821
+carry unwind,2024-07-29,2024-08-16,3,1,0.333,True,2024-08-06,1,0.9758,svm,0.839,0.898,0.794,0.856
+tariff shock,2025-04-02,2025-05-09,5,5,1.0,True,2025-04-08,0,1.0,ae,0.997,0.994,0.997,0.972
