@@ -131,6 +131,47 @@ Reproduce from the repo root: `python -m src.feature_selection` (stage-1
 ranking + cluster counts) and `python -m src.sensitivity` (cache build/load +
 τ sweep).
 
+## Phase 3: out-of-sample extension 2022-2025
+
+Extends the EWS out-of-sample on **free** data
+([`notebooks/13_oos_extension.ipynb`](notebooks/13_oos_extension.ipynb); modules
+`src/y_rule.py`, `src/free_data.py`, `src/extend_dataset.py`, `src/oos_eval.py`).
+The original 2000-2021 panel and the 2019-2021 holdout stay frozen; 2022-2025 is
+a **separate second holdout**.
+
+- **Reverse-engineering `Y`** — an exhaustive parametric search (drawdown /
+  realized-vol / trailing+forward return / AND-OR-VIX combos, two equity baskets,
+  lag −2…+2) reaches only **89.3%** match vs the shipped `Y`, below the 97% gate
+  ([`y_rule.json`](outputs/tables/y_rule.json)) → **STOP**, no labels fabricated.
+  Fallback (operator-confirmed): label 2022-2025 risk-off by **ex-ante stress
+  windows OR weekly VIX ≥ 30**.
+- **Free-data source map + validation** — every frozen-36 / routing raw ticker
+  mapped to a reachable free provider (Yahoo · US Treasury XML · NY Fed SOFR ·
+  ECB · BoE · MoF Japan; the key-free FRED host is blocked in this environment)
+  ([`source_map.csv`](outputs/tables/source_map.csv)). The harness compares the
+  **transformed** free series vs the original on 2015-2021 (PASS iff corr > 0.99):
+  **12 PASS / 30 FAIL / 5 GAP**, but most FAILs are the correct instrument with
+  cross-vendor snapshot noise (US 10Y 0.989, FX ~0.82); true gaps are BDIY, Italy
+  10Y, ECSURPUS and the SOFR-vs-LIBOR break
+  ([`proxy_validation.csv`](outputs/tables/proxy_validation.csv)).
+- **Frozen-model OOS (headline)** — the dev-fit (2000-2018) frozen-36 ensemble,
+  no refit. Control on 2019-2021 reproduces the committed AUC-PR 0.784; on
+  **2022-2025 it degrades to AUC-PR ≈ 0.45 / Recall ≈ 0.36**
+  ([`oos_detection_metrics.csv`](outputs/tables/oos_detection_metrics.csv)) and
+  underperforms buy-&-hold (CAGR −0.2% vs +8.6%). It flags all four episodes at
+  least once — tariff shock cleanly (0 lag), SVB & carry with a 1-week lag, the
+  2022 inflation bear only partially and 8 weeks late
+  ([`oos_episode_detection.csv`](outputs/tables/oos_episode_detection.csv),
+  [`oos_timeline_2022_2025.png`](outputs/figures/oos_timeline_2022_2025.png)).
+- **Deployment scenario** — refitting on the full 2000-2021 + re-tuning τ lifts
+  OOS **AUC-PR +0.12, Recall +0.28, F2 +0.19**
+  ([`oos_frozen_vs_refit.csv`](outputs/tables/oos_frozen_vs_refit.csv)): the
+  frozen detector transfers poorly to the novel regimes, but updating it with the
+  extra years (incl. COVID) recovers much of the gap.
+
+Reproduce from the repo root: `python -m src.y_rule`, `python -m src.free_data`
+(re-pulls; network), `python -m src.extend_dataset`, `python -m src.oos_eval`.
+
 ## Project structure
 
 ```
@@ -145,11 +186,15 @@ ranking + cluster counts) and `python -m src.sensitivity` (cache build/load +
 │   ├── routing.py              # sub-scores + RoutingEngine + threshold optimization
 │   ├── backtest.py             # weekly backtester + full metric suite
 │   ├── feature_selection.py    # 3-stage feature selection (univariate AP, clusters, subsets)
-│   └── sensitivity.py          # fold-score cache + tau / hyperparameter / routing sensitivity
+│   ├── sensitivity.py          # fold-score cache + tau / hyperparameter / routing sensitivity
+│   ├── y_rule.py               # Phase 3: reverse-engineer Y + ex-ante fallback labels
+│   ├── free_data.py            # Phase 3: free-data source map + proxy validation harness
+│   ├── extend_dataset.py       # Phase 3: build + label the 2022-2025 extension
+│   └── oos_eval.py             # Phase 3: frozen-model OOS eval + refit deployment scenario
 ├── data/
 │   ├── raw/                    # Bloomberg .xlsx
 │   └── processed/              # cleaned/engineered parquets (features, spreads, triggers,
-│                               # walk-forward folds, sub-scores, allocations)
+│       └── extended/           # Phase 3: free raw cache + labelled 2022-2025 panels
 ├── notebooks/
 │   ├── 01_eda.ipynb            # EDA
 │   ├── 03_models_mvg.ipynb     # MVG baseline
@@ -160,6 +205,7 @@ ranking + cluster counts) and `python -m src.sensitivity` (cache build/load +
 │   ├── 10_sensitivity_tau.ipynb      # fold-score cache + tau sensitivity (Phase 2)
 │   ├── 11_feature_selection.ipynb    # clusters, importance, subset curve, holdout shot (Phase 2)
 │   ├── 12_sensitivity_surfaces.ipynb # hyperparam x tau surfaces + routing objectives (Phase 2)
+│   ├── 13_oos_extension.ipynb        # out-of-sample extension to 2022-2025 (Phase 3)
 │   └── EWS_GSoM_PoliMI.ipynb   # end-to-end orchestration (~30 s)
 ├── outputs/
 │   ├── models/                 # serialized scaler, 4 detectors, ensemble metadata
