@@ -329,12 +329,36 @@ def plot_oos_timeline(scored: pd.DataFrame, tau: float, out_path: Path | None = 
     return out_path
 
 
+def run_wp5(frozen_oos: dict, verbose: bool = True) -> dict:
+    """WP5 deployment scenario: refit the 4 detectors on the FULL 2000-2021
+    (frozen-36), re-tune tau in-sample, evaluate on the SAME 2022-2025 OOS, and
+    quantify the value of the 3 extra years of training vs the frozen-2018 model."""
+    refit = Frozen36Scorer(refit_full_2021=True, retune_tau=True)
+    oos_refit = run_oos(refit, "refit_2021", verbose)
+    rows = [{"model": "frozen_2018", "tau": round(FROZEN_TAU, 4),
+             **{k: round(frozen_oos["metrics"][k], 4) for k in METRIC_KEYS}},
+            {"model": "refit_2021", "tau": round(refit.tau, 4),
+             **{k: round(oos_refit["metrics"][k], 4) for k in METRIC_KEYS}}]
+    cmp = pd.DataFrame(rows)
+    if verbose:
+        print("\n" + "=" * 80)
+        print("WP5 — DEPLOYMENT SCENARIO: frozen-2018 vs refit-2021 on the SAME 2022-2025 OOS")
+        print("=" * 80)
+        print(cmp.to_string(index=False))
+        d = cmp.iloc[1][METRIC_KEYS].astype(float) - cmp.iloc[0][METRIC_KEYS].astype(float)
+        print("\nvalue of 3 extra years (refit - frozen):",
+              {k: round(float(d[k]), 4) for k in METRIC_KEYS})
+    return {"comparison": cmp, "oos_refit": oos_refit, "refit_scorer": refit}
+
+
 def main(verbose: bool = True) -> dict:
     scorer = Frozen36Scorer()
     control = run_control(scorer, verbose)
     oos = run_oos(scorer, "frozen_2018", verbose)
     bt = run_backtest(oos["scored"], verbose)
     plot_oos_timeline(oos["scored"], scorer.tau)
+    wp5 = run_wp5(oos, verbose)
+    wp5["comparison"].to_csv(TABLES / "oos_frozen_vs_refit.csv", index=False)
 
     # persist tables
     TABLES.mkdir(parents=True, exist_ok=True)
@@ -344,7 +368,7 @@ def main(verbose: bool = True) -> dict:
     oos["episodes"].to_csv(TABLES / "oos_episode_detection.csv", index=False)
     bt["summary"].to_csv(TABLES / "oos_backtest_metrics.csv")
     oos["scored"].to_csv(TABLES / "oos_scored_2022_2025.csv")
-    return {"control": control, "oos": oos, "backtest": bt}
+    return {"control": control, "oos": oos, "backtest": bt, "wp5": wp5}
 
 
 if __name__ == "__main__":
