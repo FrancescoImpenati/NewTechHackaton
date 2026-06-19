@@ -245,5 +245,109 @@ def build_patched_panels(verbose: bool = True) -> dict:
     return summary
 
 
+# --------------------------------------------------------------------------
+# FIX-3 — re-run WP4 (frozen) + WP5 (refit) on the patched panel; before/after
+# --------------------------------------------------------------------------
+REDUCED_NEUTRALIZE = ["BDIY", "ECSURPUS", "US0001M"]   # Italy features now real
+TABLES_DIR = PROJECT_ROOT / "outputs" / "tables"
+FIGURES_DIR = PROJECT_ROOT / "outputs" / "figures"
+
+
+def run_fix3(verbose: bool = True) -> dict:
+    """Re-score frozen-2018 and refit-2021 on the neutralized (DX-3) AND the
+    Italy-10Y-patched 2022-2025 panels, in one process (same fitted models, so
+    the before/after delta isolates the feature gap, not AE drift)."""
+    from src.oos_eval import (METRIC_KEYS, Frozen36Scorer, run_control, run_oos)
+
+    frozen = Frozen36Scorer()
+    control = run_control(frozen, verbose)
+    ref_aucpr = control["committed"]["AUC_PR"]
+    if abs(control["metrics"]["AUC_PR"] - ref_aucpr) >= 0.02:
+        raise RuntimeError(
+            f"CONTROL MOVED: AUC-PR {control['metrics']['AUC_PR']:.4f} vs "
+            f"{ref_aucpr:.4f} — something leaked into the 2019-2021 control; stop.")
+
+    fb = run_oos(frozen, "frozen_neutralized", verbose=False)
+    fa = run_oos(frozen, "frozen_it10y", verbose=False,
+                 panel_path=PATCHED_MODEL, neutralize=REDUCED_NEUTRALIZE)
+    refit = Frozen36Scorer(refit_full_2021=True, retune_tau=True)
+    rb = run_oos(refit, "refit_neutralized", verbose=False)
+    ra = run_oos(refit, "refit_it10y", verbose=False,
+                 panel_path=PATCHED_MODEL, neutralize=REDUCED_NEUTRALIZE)
+
+    runs = [("frozen_2018", "neutralized", fb), ("frozen_2018", "it10y_patched", fa),
+            ("refit_2021", "neutralized", rb), ("refit_2021", "it10y_patched", ra)]
+    table = pd.DataFrame([{"model": m, "panel": p, "tau": round(
+        (frozen.tau if m == "frozen_2018" else refit.tau), 4),
+        **{k: round(r["metrics"][k], 4) for k in METRIC_KEYS}} for m, p, r in runs])
+
+    epi_rows = []
+    for m, p, r in runs:
+        for _, e in r["episodes"].iterrows():
+            epi_rows.append({"model": m, "panel": p, "episode": e["episode"],
+                             "coverage": e["coverage"], "n_flagged": int(e["n_flagged"]),
+                             "lead_lag_weeks": e["lead_lag_weeks_vs_start"],
+                             "dominant_model": e["dominant_model"]})
+    epi = pd.DataFrame(epi_rows)
+
+    TABLES_DIR.mkdir(parents=True, exist_ok=True)
+    table.to_csv(TABLES_DIR / "oos_it10y_before_after.csv", index=False)
+    epi.to_csv(TABLES_DIR / "oos_it10y_episode_before_after.csv", index=False)
+    _plot_before_after(table)
+
+    if verbose:
+        print("\n" + "=" * 86)
+        print("FIX-3 — BEFORE (neutralized) vs AFTER (Italy-10Y patched), same fitted models")
+        print("=" * 86)
+        print(table.to_string(index=False))
+        print("\n2022 inflation-bear episode (coverage / flags / lag):")
+        bear = epi[epi.episode == "2022 inflation bear"]
+        print(bear.to_string(index=False))
+        fd = table[table.model == "frozen_2018"].set_index("panel")
+        rd = table[table.model == "refit_2021"].set_index("panel")
+        print("\nINTERPRETATION (<=8 lines):")
+        print(f"- Frozen AUC-PR {fd.loc['neutralized','AUC_PR']:.3f} -> "
+              f"{fd.loc['it10y_patched','AUC_PR']:.3f} "
+              f"({fd.loc['it10y_patched','AUC_PR']-fd.loc['neutralized','AUC_PR']:+.3f}) "
+              f"once the BTP-Bund spread is restored.")
+        print(f"- Refit  AUC-PR {rd.loc['neutralized','AUC_PR']:.3f} -> "
+              f"{rd.loc['it10y_patched','AUC_PR']:.3f} "
+              f"({rd.loc['it10y_patched','AUC_PR']-rd.loc['neutralized','AUC_PR']:+.3f}).")
+        gap_share = fd.loc['it10y_patched','AUC_PR'] - fd.loc['neutralized','AUC_PR']
+        total_gap = 0.784 - fd.loc['neutralized','AUC_PR']
+        print(f"- Of the 0.78->{fd.loc['neutralized','AUC_PR']:.2f} frozen OOS drop, the Italy gap "
+              f"explains ~{gap_share:+.3f} AUC-PR; the remainder is genuine regime-transfer failure.")
+        print(f"- frozen->refit AUC-PR delta: neutralized "
+              f"{rd.loc['neutralized','AUC_PR']-fd.loc['neutralized','AUC_PR']:+.3f} vs patched "
+              f"{rd.loc['it10y_patched','AUC_PR']-fd.loc['it10y_patched','AUC_PR']:+.3f} "
+              f"(does closing the gap change the refit verdict?).")
+    return {"table": table, "episodes": epi, "control": control}
+
+
+def _plot_before_after(table: pd.DataFrame, out_path: Path | None = None):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    metrics = ["AUC_PR", "F_beta_2", "Recall", "Precision"]
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), sharey=True)
+    for ax, model in zip(axes, ["frozen_2018", "refit_2021"]):
+        sub = table[table.model == model].set_index("panel")
+        x = np.arange(len(metrics)); w = 0.38
+        ax.bar(x - w / 2, [sub.loc["neutralized", k] for k in metrics], w,
+               label="neutralized (before)", color="#bdbdbd")
+        ax.bar(x + w / 2, [sub.loc["it10y_patched", k] for k in metrics], w,
+               label="Italy-10Y patched (after)", color="#3182bd")
+        ax.set_xticks(x); ax.set_xticklabels(["AUC-PR", "F2", "Recall", "Prec"])
+        ax.set_title(model); ax.set_ylim(0, 1); ax.legend(fontsize=8)
+    fig.suptitle("Frozen-36 OOS 2022-2025: before vs after Italy-10Y patch")
+    fig.tight_layout()
+    out_path = out_path or FIGURES_DIR / "oos_it10y_before_after.png"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    return out_path
+
+
 if __name__ == "__main__":
     build_patched_panels()
+    run_fix3()

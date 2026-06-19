@@ -1,0 +1,17 @@
+model,panel,episode,coverage,n_flagged,lead_lag_weeks,dominant_model
+frozen_2018,neutralized,2022 inflation bear,0.286,12,8,mvg
+frozen_2018,neutralized,SVB / banking stress,0.25,2,1,ae
+frozen_2018,neutralized,carry unwind,0.333,1,1,ae
+frozen_2018,neutralized,tariff shock,1.0,5,0,ae
+frozen_2018,it10y_patched,2022 inflation bear,0.333,14,8,mvg
+frozen_2018,it10y_patched,SVB / banking stress,0.25,2,1,ae
+frozen_2018,it10y_patched,carry unwind,0.333,1,1,ae
+frozen_2018,it10y_patched,tariff shock,1.0,5,0,ae
+refit_2021,neutralized,2022 inflation bear,0.643,27,8,mvg
+refit_2021,neutralized,SVB / banking stress,0.375,3,1,ae
+refit_2021,neutralized,carry unwind,0.667,2,1,if
+refit_2021,neutralized,tariff shock,1.0,5,0,ae
+refit_2021,it10y_patched,2022 inflation bear,0.667,28,5,mvg
+refit_2021,it10y_patched,SVB / banking stress,0.375,3,1,ae
+refit_2021,it10y_patched,carry unwind,0.667,2,1,if
+refit_2021,it10y_patched,tariff shock,1.0,5,0,ae

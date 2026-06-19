@@ -73,6 +73,9 @@ class Frozen36Scorer:
         for name in MODEL_ORDER:
             self.fitted[name] = clone_unfit(self.production[name]).fit(Xn)
             self.ref[name] = self.fitted[name].score_samples(Xn)
+        # default neutralization set (DX-4/5 behaviour); overridable per call
+        # so the Italy-10Y patch can score with a reduced set additively.
+        self.neutralize = list(NEUTRALIZE_FEATURES)
         self.tau = self._retune_tau(fit_frame) if retune_tau else FROZEN_TAU
 
     def _retune_tau(self, fit_frame) -> float:
@@ -82,26 +85,27 @@ class Frozen36Scorer:
         eps, _ = _tune_threshold(ens, ens, fit_frame["Y"].to_numpy())
         return float(eps)
 
-    def _prepare(self, panel: pd.DataFrame) -> pd.DataFrame:
+    def _prepare(self, panel: pd.DataFrame, neutralize=None) -> pd.DataFrame:
         """Neutralize gap features to the dev mean (-> standardized 0)."""
+        neutralize = self.neutralize if neutralize is None else neutralize
         p = panel.copy()
-        for f in NEUTRALIZE_FEATURES:
+        for f in neutralize:
             if f in p.columns:
                 p[f] = self.fit_mean[f]
         return p
 
-    def per_model_pct(self, panel: pd.DataFrame) -> dict[str, np.ndarray]:
-        X = self.scaler.transform_holdout(self._prepare(panel))
+    def per_model_pct(self, panel: pd.DataFrame, neutralize=None) -> dict[str, np.ndarray]:
+        X = self.scaler.transform_holdout(self._prepare(panel, neutralize))
         return {n: score_to_percentile(self.ref[n], self.fitted[n].score_samples(X))
                 for n in MODEL_ORDER}
 
-    def _ensemble(self, panel: pd.DataFrame) -> np.ndarray:
-        pct = self.per_model_pct(panel)
+    def _ensemble(self, panel: pd.DataFrame, neutralize=None) -> np.ndarray:
+        pct = self.per_model_pct(panel, neutralize)
         return np.median(np.array([pct[n] for n in MODEL_ORDER]), axis=0)
 
-    def score(self, panel: pd.DataFrame) -> pd.DataFrame:
+    def score(self, panel: pd.DataFrame, neutralize=None) -> pd.DataFrame:
         """Return per-week ensemble score, flag, and the 4 per-model percentiles."""
-        pct = self.per_model_pct(panel)
+        pct = self.per_model_pct(panel, neutralize)
         ens = np.median(np.array([pct[n] for n in MODEL_ORDER]), axis=0)
         out = pd.DataFrame({"ens": ens, "flag": (ens >= self.tau).astype(int)},
                            index=panel.index)
@@ -175,11 +179,16 @@ def run_control(scorer: Frozen36Scorer, verbose: bool = True) -> dict:
     return {"metrics": m, "committed": ref.to_dict(), "scored": scored}
 
 
-def run_oos(scorer: Frozen36Scorer, label: str = "frozen_2018", verbose: bool = True) -> dict:
-    """Score the free-data 2022-2025 second holdout."""
-    panel = pd.read_parquet(EXTENDED / "model_panel_ext.parquet")
+def run_oos(scorer: Frozen36Scorer, label: str = "frozen_2018", verbose: bool = True,
+            panel_path: str | Path | None = None, neutralize=None) -> dict:
+    """Score the free-data 2022-2025 second holdout.
+
+    ``panel_path`` / ``neutralize`` default to the DX-3 neutralized panel and the
+    full neutralization set (DX-4 behaviour); the Italy-10Y patch (FIX-3) passes
+    the patched panel and the reduced set additively."""
+    panel = pd.read_parquet(panel_path or (EXTENDED / "model_panel_ext.parquet"))
     oos = panel.loc["2022-01-01":"2025-12-31"]
-    scored = scorer.score(oos[scorer.cols])
+    scored = scorer.score(oos[scorer.cols], neutralize)
     m = detection_metrics(scored)
     epi = episode_analysis(scored, scorer.tau)
     if verbose:
