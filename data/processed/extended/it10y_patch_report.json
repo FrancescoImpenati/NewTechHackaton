@@ -1,0 +1,23 @@
+{
+  "source": "cache",
+  "fidelity": {
+    "n_overlap": 328,
+    "corr_level": 0.9986,
+    "corr_diff_transformed": 0.969,
+    "corr_it_de_10y_spread": 0.9951,
+    "tier": "STRONG",
+    "flag": "OK"
+  },
+  "italy_features_na_in_oos": {
+    "GTITL10YR": 0,
+    "it_de_10y": 0,
+    "it_de_10y_chg4w": 0
+  },
+  "patched_raw": "data\\processed\\extended\\raw_panel_free_it10y.parquet",
+  "patched_model": "data\\processed\\extended\\model_panel_ext_it10y.parquet",
+  "neutralized_remaining": [
+    "BDIY",
+    "ECSURPUS",
+    "US0001M"
+  ]
+}
