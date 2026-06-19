@@ -172,6 +172,40 @@ a **separate second holdout**.
 Reproduce from the repo root: `python -m src.y_rule`, `python -m src.free_data`
 (re-pulls; network), `python -m src.extend_dataset`, `python -m src.oos_eval`.
 
+### Italy 10Y patch (FIX)
+
+The headline OOS numbers above are a **lower bound**: Italy 10Y had no free source
+in Phase 3, so `GTITL10YR` and the BTP-Bund spread (`it_de_10y`, `it_de_10y_chg4w`
+— the #1-importance cluster from Phase 2) were neutralized to the dev mean. They
+**are** available free: `src/it10y_patch.py` sources Italy 10Y from the
+investing.com historical API (stooq is JS-walled, investpy defunct), validates it
+(transformed-diff corr **0.969**, BTP-Bund spread corr **0.995** on 2015-2021),
+and rebuilds the three features through the unmodified `src.features` pipeline into
+a panel saved **alongside** the neutralized one
+([`model_panel_ext_it10y.parquet`](data/processed/extended/),
+[`notebooks/14_it10y_patch.ipynb`](notebooks/14_it10y_patch.ipynb)).
+
+Re-scoring frozen and refit on the patched panel (same fitted models, control
+still reproduces 0.784) gives — **before → after**
+([`oos_it10y_before_after.csv`](outputs/tables/oos_it10y_before_after.csv),
+[`oos_it10y_before_after.png`](outputs/figures/oos_it10y_before_after.png)):
+
+| model | AUC-PR | F2 | Recall |
+|---|---|---|---|
+| frozen-2018 neutralized (lower bound) | 0.444 | 0.375 | 0.362 |
+| frozen-2018 Italy-10Y patched | **0.449** | **0.387** | **0.379** |
+| refit-2021 neutralized | 0.580 | 0.566 | 0.638 |
+| refit-2021 Italy-10Y patched | **0.593** | **0.606** | **0.690** |
+
+(AE re-fit nondeterminism wobbles the absolute values ±0.01 run-to-run; the
+before/after delta is the stable quantity since both share the fitted models.)
+The patch lifts frozen OOS AUC-PR only **~+0.005** (F2 +0.01, Recall +0.02) and
+refit ~+0.013; the 2022 inflation-bear coverage rises and the refit's first flag
+moves **8→5 weeks** earlier. So the gap explains only a small slice of the
+0.78→0.45 drop — the rest is **genuine regime-transfer failure**, and the
+frozen→refit verdict (≈+0.13 AUC-PR) is unchanged. Reproduce:
+`python -m src.it10y_patch`.
+
 ## Project structure
 
 ```
@@ -190,7 +224,8 @@ Reproduce from the repo root: `python -m src.y_rule`, `python -m src.free_data`
 │   ├── y_rule.py               # Phase 3: reverse-engineer Y + ex-ante fallback labels
 │   ├── free_data.py            # Phase 3: free-data source map + proxy validation harness
 │   ├── extend_dataset.py       # Phase 3: build + label the 2022-2025 extension
-│   └── oos_eval.py             # Phase 3: frozen-model OOS eval + refit deployment scenario
+│   ├── oos_eval.py             # Phase 3: frozen-model OOS eval + refit deployment scenario
+│   └── it10y_patch.py          # Phase 3 FIX: source Italy 10Y + un-neutralize + before/after
 ├── data/
 │   ├── raw/                    # Bloomberg .xlsx
 │   └── processed/              # cleaned/engineered parquets (features, spreads, triggers,
@@ -206,6 +241,7 @@ Reproduce from the repo root: `python -m src.y_rule`, `python -m src.free_data`
 │   ├── 11_feature_selection.ipynb    # clusters, importance, subset curve, holdout shot (Phase 2)
 │   ├── 12_sensitivity_surfaces.ipynb # hyperparam x tau surfaces + routing objectives (Phase 2)
 │   ├── 13_oos_extension.ipynb        # out-of-sample extension to 2022-2025 (Phase 3)
+│   ├── 14_it10y_patch.ipynb          # Italy-10Y patch: before/after OOS (Phase 3 FIX)
 │   └── EWS_GSoM_PoliMI.ipynb   # end-to-end orchestration (~30 s)
 ├── outputs/
 │   ├── models/                 # serialized scaler, 4 detectors, ensemble metadata
