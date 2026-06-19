@@ -1,0 +1,32 @@
+{
+  "span": [
+    "2014-01-07",
+    "2025-12-30"
+  ],
+  "n_rows_total": 626,
+  "oos_window": [
+    "2022-01-01",
+    "2025-12-31"
+  ],
+  "n_rows_oos": 209,
+  "n_features": 36,
+  "neutralized_features": [
+    "BDIY",
+    "ECSURPUS",
+    "GTITL10YR",
+    "it_de_10y",
+    "it_de_10y_chg4w",
+    "US0001M"
+  ],
+  "neutralized_reason": "no usable free instrument or SOFR/LIBOR break; filled with development mean at inference",
+  "oos_label_rule": "ex_ante windows OR weekly VIX>=30 (y_rule.json)",
+  "oos_y_prevalence": 0.2775,
+  "oos_n_pos": 58,
+  "features_with_gaps_in_oos": {
+    "BDIY": 209,
+    "ECSURPUS": 209,
+    "GTITL10YR": 209,
+    "it_de_10y": 209,
+    "it_de_10y_chg4w": 209
+  }
+}

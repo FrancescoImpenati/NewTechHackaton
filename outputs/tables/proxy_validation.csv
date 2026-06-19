@@ -1,0 +1,48 @@
+feature,role,n_overlap,corr,status,tier,usable,proxies,note
+BDIY,frozen36,0,,GAP,GAP,False,BDIY->GAP,no free source / insufficient overlap
+Cl1,frozen36,329,1.0,PASS,PASS,True,Cl1->yahoo:CL=F,
+ECSURPUS,frozen36,0,,GAP,GAP,False,ECSURPUS->GAP,no free source / insufficient overlap
+EONIA,frozen36,329,0.2691,FAIL,GAP,False,EONIA->splice_eonia:,"weak proxy: correct asset class, materially different series"
+GBP,frozen36,329,0.8282,FAIL,WEAK,True,GBP->yahoo:GBPUSD=X,"weak proxy: correct asset class, materially different series"
+GT10,frozen36,329,0.9885,FAIL,STRONG,True,GT10->treasury:10 Yr,correct instrument; cross-vendor weekly-snapshot return noise
+GTDEM10Y,frozen36,329,0.9478,FAIL,MODERATE,True,GTDEM10Y->ecb:B.U2.EUR.4F.G_N_A.SV_C_YM.SR_10Y,correct instrument; cross-vendor weekly-snapshot return noise
+GTGBP2Y,frozen36,329,0.8545,FAIL,MODERATE,True,GTGBP2Y->boe:IUDSNPY,correct instrument; cross-vendor weekly-snapshot return noise
+GTITL10YR,frozen36,0,,GAP,GAP,False,GTITL10YR->GAP,no free source / insufficient overlap
+GTJPY2YR,frozen36,329,0.9621,FAIL,STRONG,True,GTJPY2YR->mof:2Y,correct instrument; cross-vendor weekly-snapshot return noise
+GTJPY30YR,frozen36,329,0.9859,FAIL,STRONG,True,GTJPY30YR->mof:30Y,correct instrument; cross-vendor weekly-snapshot return noise
+JPY,frozen36,329,0.8207,FAIL,WEAK,True,JPY->yahoo:JPY=X,"weak proxy: correct asset class, materially different series"
+LF94TRUU,frozen36,329,0.6858,FAIL,WEAK,True,LF94TRUU->yahoo:TIP,ETF total-return proxy vs Bloomberg index TR (different basket/duration)
+LMBITR,frozen36,329,0.3753,FAIL,GAP,False,LMBITR->yahoo:MBB,ETF total-return proxy vs Bloomberg index TR (different basket/duration)
+LP01TREU,frozen36,329,0.4857,FAIL,GAP,False,LP01TREU->yahoo:IEAG.L,ETF total-return proxy vs Bloomberg index TR (different basket/duration)
+MXBR,frozen36,329,0.9675,FAIL,STRONG,True,MXBR->yahoo:EWZ,correct instrument; cross-vendor weekly-snapshot return noise
+MXCN,frozen36,329,0.9352,FAIL,MODERATE,True,MXCN->yahoo:MCHI,correct instrument; cross-vendor weekly-snapshot return noise
+MXJP,frozen36,329,0.8166,FAIL,WEAK,True,MXJP->yahoo:EWJ,"weak proxy: correct asset class, materially different series"
+MXUS,frozen36,329,0.9988,PASS,PASS,True,MXUS->yahoo:^GSPC,
+US0001M,frozen36,159,0.0649,FAIL,GAP,False,US0001M->sofr:,SOFR (secured) vs 1M LIBOR (unsecured): economic break in the spread
+USGG3M,frozen36,329,0.9407,FAIL,MODERATE,True,USGG3M->treasury:3 Mo,correct instrument; cross-vendor weekly-snapshot return noise
+VIX,frozen36,329,1.0,PASS,PASS,True,VIX->yahoo:^VIX,
+XAUBGNL,frozen36,329,0.989,FAIL,STRONG,True,XAUBGNL->yahoo:GC=F,correct instrument; cross-vendor weekly-snapshot return noise
+de_term_10y_2y,frozen36,329,0.9951,PASS,PASS,True,"GTDEM10Y->ecb:B.U2.EUR.4F.G_N_A.SV_C_YM.SR_10Y, GTDEM2Y->ecb:B.U2.EUR.4F.G_N_A.SV_C_YM.SR_2Y",
+de_term_10y_2y_chg4w,frozen36,329,0.9485,FAIL,MODERATE,True,"GTDEM10Y->ecb:B.U2.EUR.4F.G_N_A.SV_C_YM.SR_10Y, GTDEM2Y->ecb:B.U2.EUR.4F.G_N_A.SV_C_YM.SR_2Y",correct instrument; cross-vendor weekly-snapshot return noise
+em_spread_chg4w,frozen36,329,0.9173,FAIL,MODERATE,True,"LUACTRUU->yahoo:LQD, EMUSTRUU->yahoo:EMB",ETF total-return proxy vs Bloomberg index TR (different basket/duration)
+equity_bond_rot,frozen36,329,0.9849,FAIL,STRONG,True,"MXUS->yahoo:^GSPC, LUACTRUU->yahoo:LQD",correct instrument; cross-vendor weekly-snapshot return noise
+gold_oil_ratio,frozen36,329,1.0,PASS,PASS,True,"XAUBGNL->yahoo:GC=F, Cl1->yahoo:CL=F",
+hy_ig_spread,frozen36,329,0.8283,FAIL,WEAK,True,"LUACTRUU->yahoo:LQD, LF98TRUU->yahoo:HYG",ETF total-return proxy vs Bloomberg index TR (different basket/duration)
+it_de_10y,frozen36,0,,GAP,GAP,False,"GTITL10YR->GAP, GTDEM10Y->ecb:B.U2.EUR.4F.G_N_A.SV_C_YM.SR_10Y",no free source / insufficient overlap
+it_de_10y_chg4w,frozen36,0,,GAP,GAP,False,"GTITL10YR->GAP, GTDEM10Y->ecb:B.U2.EUR.4F.G_N_A.SV_C_YM.SR_10Y",no free source / insufficient overlap
+jpy_strength,frozen36,329,0.9513,FAIL,STRONG,True,JPY->yahoo:JPY=X,correct instrument; cross-vendor weekly-snapshot return noise
+us_de_10y_chg4w,frozen36,329,0.9606,FAIL,STRONG,True,"GT10->treasury:10 Yr, GTDEM10Y->ecb:B.U2.EUR.4F.G_N_A.SV_C_YM.SR_10Y",correct instrument; cross-vendor weekly-snapshot return noise
+us_term_10y_2y_chg4w,frozen36,329,0.9896,FAIL,STRONG,True,"GT10->treasury:10 Yr, USGG2YR->treasury:2 Yr",correct instrument; cross-vendor weekly-snapshot return noise
+vrp,frozen36,329,0.9975,PASS,PASS,True,"VIX->yahoo:^VIX, MXUS->yahoo:^GSPC",
+equity_bond_corr_13w,frozen36,329,0.9543,FAIL,STRONG,True,"MXUS->yahoo:^GSPC, LUACTRUU->yahoo:LQD",correct instrument; cross-vendor weekly-snapshot return noise
+libor_3m_spread_chg4w,routing,156,-0.1251,FAIL,GAP,False,"US0001M->sofr:, USGG3M->treasury:3 Mo",SOFR (secured) vs 1M LIBOR (unsecured): economic break in the spread
+dxy_chg4w,routing,329,0.9996,PASS,PASS,True,DXY->yahoo:DX-Y.NYB,
+us_10y_diff_chg4w,routing,329,0.988,FAIL,STRONG,True,GT10->treasury:10 Yr,correct instrument; cross-vendor weekly-snapshot return noise
+usa_world_relative,routing,329,0.6637,FAIL,WEAK,True,"MXUS->yahoo:^GSPC, MXEU->yahoo:VGK, MXJP->yahoo:EWJ","weak proxy: correct asset class, materially different series"
+real_yield_proxy_chg4w,routing,329,0.9937,PASS,PASS,True,"GT10->treasury:10 Yr, LF94TRUU->yahoo:TIP",
+gold_oil_ratio_chg4w,routing,329,0.9999,PASS,PASS,True,"XAUBGNL->yahoo:GC=F, Cl1->yahoo:CL=F",
+vix_level,routing,329,1.0,PASS,PASS,True,VIX->yahoo:^VIX,
+us_10y_vol_4w,routing,329,0.9791,FAIL,STRONG,True,GT10->treasury:10 Yr,correct instrument; cross-vendor weekly-snapshot return noise
+us_term_10y_2y_level,routing,329,0.9996,PASS,PASS,True,"GT10->treasury:10 Yr, USGG2YR->treasury:2 Yr",
+libor_3m_spread_level,routing,160,0.125,FAIL,GAP,False,"US0001M->sofr:, USGG3M->treasury:3 Mo",SOFR (secured) vs 1M LIBOR (unsecured): economic break in the spread
+mxus_drawdown_52w,routing,329,0.9983,PASS,PASS,True,MXUS->yahoo:^GSPC,

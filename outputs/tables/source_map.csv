@@ -1,0 +1,31 @@
+raw_ticker,role,provider,identifier,note
+BDIY,frozen36,GAP,,Baltic Dry Index — no free historical API
+Cl1,both,yahoo,CL=F,
+DXY,routing,yahoo,DX-Y.NYB,
+ECSURPUS,frozen36,GAP,,US economic surprise index — proprietary (dropped per WP2 brief)
+EMUSTRUU,frozen36,yahoo,EMB,
+EONIA,frozen36,splice_eonia,,EONIA -> €STR from 2022-01-03 (EONIA discontinued)
+GBP,frozen36,yahoo,GBPUSD=X,
+GT10,both,treasury,10 Yr,
+GTDEM10Y,frozen36,ecb,B.U2.EUR.4F.G_N_A.SV_C_YM.SR_10Y,
+GTDEM2Y,frozen36,ecb,B.U2.EUR.4F.G_N_A.SV_C_YM.SR_2Y,
+GTGBP2Y,frozen36,boe,IUDSNPY,
+GTITL10YR,frozen36,GAP,,"Italy 10Y — ECB exposes only AAA / GDP-weighted curves, not IT"
+GTJPY2YR,frozen36,mof,2Y,
+GTJPY30YR,frozen36,mof,30Y,
+JPY,both,yahoo,JPY=X,
+LF94TRUU,both,yahoo,TIP,
+LF98TRUU,frozen36,yahoo,HYG,
+LMBITR,frozen36,yahoo,MBB,
+LP01TREU,frozen36,yahoo,IEAG.L,
+LUACTRUU,both,yahoo,LQD,
+MXBR,frozen36,yahoo,EWZ,
+MXCN,frozen36,yahoo,MCHI,
+MXEU,routing,yahoo,VGK,
+MXJP,both,yahoo,EWJ,
+MXUS,both,yahoo,^GSPC,
+US0001M,both,sofr,,1M USD LIBOR proxied by SOFR (LIBOR ceased 2023-06; SOFR used throughout)
+USGG2YR,both,treasury,2 Yr,
+USGG3M,both,treasury,3 Mo,
+VIX,both,yahoo,^VIX,
+XAUBGNL,both,yahoo,GC=F,
